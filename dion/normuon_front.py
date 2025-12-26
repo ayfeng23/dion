@@ -327,7 +327,7 @@ class NorMuonFront(Optimizer):
                 # Otherwise, we parallelize the Muon update across devices
                 else:
                     yield AsyncTask(
-                        normuon_update_batch_async(
+                        normuon_front_update_batch_async(
                             X=pad_batch(params, self._world_size),
                             G=pad_batch(gradients, self._world_size),
                             M=pad_batch(momentums, self._world_size),
@@ -463,12 +463,12 @@ def normuon_front_update_batch_async(
     # Removed Newton Schuz Orthogonalization 
     
     # NorMuon Front normalization, removed the rescaling
-    U = normuon_front_normalization(
+    U = list(normuon_front_normalization(
         M_new,
         V=to_local(V),
         muon_beta2=muon_beta2,
-    )
-    
+    ))
+
     #Newton Schulz Update
     # Get one whole matrix for each device to orthogonalize
     if shard_dim is not None:
@@ -535,11 +535,13 @@ def normuon_front_update_batch_async(
         )
 
         # Allocate empty tensors to receive updates from other devices
-        U = [torch.empty_like(u) for u in U]
+        # Modified to match dtype (all bfloat_16)
+        single_matrix = single_matrix.contiguous()
+        U = [torch.empty_like(single_matrix) for _ in range(world_size)]
 
         # All gather orthogonalized results from other devices into buffer
         work = dist.all_gather(
-            U, single_matrix.contiguous(), group=process_group, async_op=True
+            U, single_matrix, group=process_group, async_op=True
         )
         yield
         work.wait()
@@ -549,6 +551,7 @@ def normuon_front_update_batch_async(
     # - 3D+ tensors sharded along a batch dimension (different whole matrices per device)
     else:
         assert len(U) == 1
+
         U[0] = muon_update_newton_schulz(
             U[0],
             newton_schulz_func=newton_schulz_func,

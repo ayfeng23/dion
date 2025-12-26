@@ -29,6 +29,8 @@ from dion import Muon
 from dion import MuonReference
 from dion import Dion2
 from dion import NorMuon
+from dion import NorMuonFront
+from dion import FracNormuon
 
 
 @dataclass
@@ -472,6 +474,64 @@ def init_optimizer(
             distributed_mesh=distributed_mesh,
             lr=hp.lr,
             mu=hp.mu,
+            muon_beta2=0.95,
+            weight_decay=hp.weight_decay,
+            nesterov=True,
+            adjust_lr=hp.adjust_lr,
+            use_triton=(not cli_args.no_triton),
+        )
+
+    elif hp.optimizer == "normuon_front":
+        if device_mesh is not None:
+            # Ensure that we have a supported device mesh configuration for NorMuon Front
+            if inner_shard_mesh is not None and inner_shard_mesh.size() > 1:
+                raise ValueError("Tensor parallel is not supported by NorMuon Front.")
+            distributed_mesh = (
+                outer_shard_mesh if outer_shard_mesh.size() > 1 else replicate_mesh
+            )
+            comm_method = "all-to-all" if outer_shard_mesh.size() > 1 else "all-gather"
+        else:
+            assert ddp_model is not None
+            distributed_mesh = ddp_model.process_group  # using ProcessGroup for DDP
+            comm_method = "all-gather"
+        print0(f"NorMuon Front LR adjust method: {hp.adjust_lr}")
+        print0(f"Triton Newton-Schulz kernels: {not cli_args.no_triton}")
+        print0(f"Distributed NorMuon Front using: {comm_method}")
+        opt = NorMuonFront(
+            param_groups,
+            distributed_mesh=distributed_mesh,
+            lr=hp.lr,
+            mu=hp.mu,
+            muon_beta2=0.95,
+            weight_decay=hp.weight_decay,
+            nesterov=True,
+            adjust_lr=hp.adjust_lr,
+            use_triton=(not cli_args.no_triton),
+        )
+        
+    elif hp.optimizer == "fracnormuon":
+        if device_mesh is not None:
+            # Ensure that we have a supported device mesh configuration
+            if inner_shard_mesh is not None and inner_shard_mesh.size() > 1:
+                raise ValueError("Tensor parallel is not supported by Fracnormuon.")
+            distributed_mesh = (
+                outer_shard_mesh if outer_shard_mesh.size() > 1 else replicate_mesh
+            )
+            comm_method = "all-to-all" if outer_shard_mesh.size() > 1 else "all-gather"
+        else:
+            assert ddp_model is not None
+            distributed_mesh = ddp_model.process_group  # using ProcessGroup for DDP
+            comm_method = "all-gather"
+        print0(f"Fracnormuon LR adjust method: {hp.adjust_lr}")
+        print0(f"Triton Newton-Schulz kernels: {not cli_args.no_triton}")
+        print0(f"Distributed Fracnormuon using: {comm_method}")
+        opt = FracNormuon(
+            param_groups,
+            distributed_mesh=distributed_mesh,
+            lr=hp.lr,
+            mu=hp.mu,
+            fraction=hp.rank_fraction,
+            ef_decay=hp.mu,
             muon_beta2=0.95,
             weight_decay=hp.weight_decay,
             nesterov=True,
