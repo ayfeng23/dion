@@ -214,7 +214,7 @@ class FracNormuon(Optimizer):
     def _create_fracnormuon_tasks(
         self,
         param_groups: List[dict],
-        algo_name: str = "fracmuon",
+        algo_name: str = "fracnormuon",
     ) -> Generator["AsyncTask", None, None]:
         """
         Helper function to create batches of matrices and generate
@@ -324,7 +324,7 @@ class FracNormuon(Optimizer):
                 # Special case for 3D tensors sharded along batch dimension
                 # As long as matrix dimensions are not sharded, each device will have whole matrices
                 # Each device already has different matrices of the batch, so we can't parallelize further
-                if is_batch_sharded and not is_matrix_sharded:
+                if not is_matrix_sharded: # modified so I don't have ot use multiple devices
 
                     # For this case, we use local momentum per shard
                     for x, g in zip(batch_params, grads):
@@ -461,6 +461,7 @@ def fracnormuon_update_local_async(
     flatten: bool,
     adjust_lr: Optional[str],
     newton_schulz_func: Optional[Callable] = None,
+    **kwargs,
 ) -> Generator[None, None, None]:
     assert len(X) == len(G) == 1
     x = X[0]
@@ -471,13 +472,13 @@ def fracnormuon_update_local_async(
         M=M,
         momentum=momentum,
         nesterov=nesterov,
-        use_ef_damping=False,
+        use_ef_damping=True,
     )
     U = list(normuon_front_normalization(
         M_new,
-        V=STATE["variance_neuron"],
+        V=[STATE["variance_neuron"]],
         muon_beta2=muon_beta2,
-    ))
+    ))[0]
 
     if adjust_lr is None:
         adjusted_lr = lr
@@ -491,11 +492,11 @@ def fracnormuon_update_local_async(
     O_local = fractional_orthonormalize_update(
         M_full=U,
         fraction=float(fraction),
-        ef_decay=ef_decay, #we can let ef_decay=1
+        ef_decay=1, #we can let ef_decay=1
         flatten=flatten,
         epsilon=epsilon,
         newton_schulz_func=newton_schulz_func,
-        interp=True,
+        interp=False,
     )
 
     # Apply update locally
@@ -720,6 +721,8 @@ def fracnormuon_update_pre_orthogonalize(
     if nesterov:
         if use_ef_damping:#not too sure how ef damping should interact with nesterov
             U = torch._foreach_mul(M, momentum)
+        else:
+            U = M
         torch._foreach_add_(U, G)
     else:
         U = M
@@ -783,7 +786,7 @@ def topk_and_orthonormalize(
     M_work[..., K] *= ef_decay
     # Construct the full update matrix
     if interp:
-        O_full = M_work.clone() #error feedback doesn't affect since those indices are replaced
+        O_full = M_work.clone().to(O_sel.dtype) #error feedback doesn't affect since those indices are replaced
     else:
         O_full = torch.zeros_like(M_work, dtype=O_sel.dtype)
     O_full.index_copy_(dim=-1, index=K, source=O_sel)

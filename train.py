@@ -874,7 +874,7 @@ def main():
     # Load hyperparameters and update with CLI arguments
     # Create a name to identify this run
     run_name = f"({hp.optimizer}+{hp.scalar_opt})"
-    if "dion" in hp.optimizer or "dion2" in hp.optimizer:
+    if "dion" in hp.optimizer or "dion2" in hp.optimizer or "fracnormuon":
         run_name += f"frac={hp.rank_fraction}"
     if cli_args.dp_size is not None:
         run_name += f"_dp={cli_args.dp_size}_fs={cli_args.fs_size}_tp={cli_args.tp_size}_gradsync={cli_args.replicate_mesh_grad_sync}"
