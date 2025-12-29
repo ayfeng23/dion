@@ -31,15 +31,14 @@ no_wandb: false
 # — Distributed training —
 dp_size: null      # data‐parallel size
 fs_size: null      # FSDP size
-tp_size: null     # DO NOT USE TP for Dion2
+tp_size: null      # DO NOT USE TP for Muon
 
 # — Miscellaneous flags —
 debug: false
 no_compile: false
 no_triton: false
 
-optimizer: dion2
-rank_fraction: 0.75
-scalar_opt: lion
+optimizer: testoptimizer 
+scalar_opt: adamw
 adjust_lr: spectral_norm
 lr: 0.02

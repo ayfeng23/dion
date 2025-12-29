@@ -31,6 +31,7 @@ from dion import Dion2
 from dion import NorMuon
 from dion import NorMuonFront
 from dion import FracNormuon
+from dion import TestOptimizer
 
 
 @dataclass
@@ -539,6 +540,36 @@ def init_optimizer(
             use_triton=(not cli_args.no_triton),
         )
 
+    elif hp.optimizer == "testoptimizer":
+        if device_mesh is not None:
+            # Ensure that we have a supported device mesh configuration
+            if inner_shard_mesh is not None and inner_shard_mesh.size() > 1:
+                raise ValueError("Tensor parallel is not supported by TestOptimizer.")
+            distributed_mesh = (
+                outer_shard_mesh if outer_shard_mesh.size() > 1 else replicate_mesh
+            )
+            comm_method = "all-to-all" if outer_shard_mesh.size() > 1 else "all-gather"
+        else:
+            assert ddp_model is not None
+            distributed_mesh = ddp_model.process_group  # using ProcessGroup for DDP
+            comm_method = "all-gather"
+        print0(f"TestOptimizer LR adjust method: {hp.adjust_lr}")
+        print0(f"Triton Newton-Schulz kernels: {not cli_args.no_triton}")
+        print0(f"Distributed TestOptimizer using: {comm_method}")
+        opt = TestOptimizer(
+            param_groups,
+            distributed_mesh=distributed_mesh,
+            lr=hp.lr,
+            mu=hp.mu,
+            fraction=hp.rank_fraction,
+            ef_decay=hp.mu,
+            muon_beta2=0.95,
+            weight_decay=hp.weight_decay,
+            nesterov=True,
+            adjust_lr=hp.adjust_lr,
+            use_triton=(not cli_args.no_triton),
+        )
+
     elif hp.optimizer == "dion_simple":
         assert device_mesh is None, f"{hp.optimizer} does not support device mesh"
         print0(f"Dion rank fraction: {hp.rank_fraction}")
@@ -874,7 +905,7 @@ def main():
     # Load hyperparameters and update with CLI arguments
     # Create a name to identify this run
     run_name = f"({hp.optimizer}+{hp.scalar_opt})"
-    if "dion" in hp.optimizer or "dion2" in hp.optimizer or "fracnormuon":
+    if "dion" in hp.optimizer or "dion2" in hp.optimizer or "fracnormuon" in hp.optimizer:
         run_name += f"frac={hp.rank_fraction}"
     if cli_args.dp_size is not None:
         run_name += f"_dp={cli_args.dp_size}_fs={cli_args.fs_size}_tp={cli_args.tp_size}_gradsync={cli_args.replicate_mesh_grad_sync}"

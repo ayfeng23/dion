@@ -9,6 +9,7 @@ from torch.optim.optimizer import Optimizer, ParamsT
 from typing import Callable, Generator, List, Optional, Tuple, Union
 from .muon import muon_update_pre_orthogonalize
 from .normuon_front import normuon_front_normalization
+from .dion2 import dion2_update_post_orthogonalize
 
 from .newton_schulz_triton import newton_schulz_triton, zeropower_via_newtonschulz5
 from .opt_utils import (
@@ -36,7 +37,7 @@ def _full_dtype_and_shape(p: Tensor) -> Tuple[torch.Size, torch.dtype, torch.dev
     return p.size(), p.dtype, p.device
 
 
-class FracNormuon(Optimizer):
+class TestOptimizer(Optimizer):
     def __init__(
         self,
         params: ParamsT,
@@ -83,7 +84,7 @@ class FracNormuon(Optimizer):
             flatten=flatten,
             nesterov=nesterov,
             adjust_lr=adjust_lr,
-            algorithm="fracnormuon",
+            algorithm="testoptimizer",
             step=0,
             fraction=fraction,
         )
@@ -132,7 +133,7 @@ class FracNormuon(Optimizer):
                 loss = closure()
 
         # Group by optimizers
-        fracnormuon_groups = []
+        testoptimizer_groups = []
         lion_groups = []
         adamw_groups = []
 
@@ -141,8 +142,8 @@ class FracNormuon(Optimizer):
 
             # Split parameter groups by algorithm
             algo = group["algorithm"]
-            if algo == "fracnormuon":
-                fracnormuon_groups.append(group)
+            if algo == "testoptimizer":
+                testoptimizer_groups.append(group)
             elif algo == "lion":
                 lion_groups.append(group)
             elif algo == "adamw":
@@ -151,11 +152,11 @@ class FracNormuon(Optimizer):
                 raise ValueError(f"Unknown algorithm: {algo}")
 
         # Create async tasks for each algorithm
-        fracnormuon_tasks = self._create_fracnormuon_tasks(fracnormuon_groups)
+        testoptimizer_tasks = self._create_testoptimizer_tasks(testoptimizer_groups)
         lion_tasks = self._create_lion_tasks(lion_groups)
         adamw_tasks = self._create_adamw_tasks(adamw_groups)
 
-        all_tasks = chain(fracnormuon_tasks, lion_tasks, adamw_tasks)
+        all_tasks = chain(testoptimizer_tasks, lion_tasks, adamw_tasks)
         runtime = AsyncRuntime(all_tasks, max_concurrent_tasks=3)
         runtime.run()
 
@@ -181,7 +182,8 @@ class FracNormuon(Optimizer):
         if "momentum_local" not in st:
             st["momentum_local"] = torch.zeros_like(param)
         if "variance_neuron" not in st:
-            st["variance_neuron"] = torch.zeros_like(param[..., 0:1])
+            st["variance_neuron"] = torch.zeros((param.size(-1), param.size(-1)), device=param.device, dtype=param.dtype)
+            # st["variance_neuron"] = torch.zeros_like(param[..., 0:1])
         return st
 
     #Only used by Adam and Lion
@@ -211,10 +213,10 @@ class FracNormuon(Optimizer):
             out.append({"momentum_full": None, "is_pad": True})
         return out
 
-    def _create_fracnormuon_tasks(
+    def _create_testoptimizer_tasks(
         self,
         param_groups: List[dict],
-        algo_name: str = "fracnormuon",
+        algo_name: str = "testoptimizer",
     ) -> Generator["AsyncTask", None, None]:
         """
         Helper function to create batches of matrices and generate
@@ -231,7 +233,7 @@ class FracNormuon(Optimizer):
                 continue
 
             # Wrap hyperparameters as tensors for torch.compile
-            fracnormuon_args = dict(
+            testoptimizer_args = dict(
                 lr=torch.tensor(group["lr"]),
                 momentum=torch.tensor(group["mu"]),
                 ef_decay=torch.tensor(group["ef_decay"]),
@@ -294,7 +296,7 @@ class FracNormuon(Optimizer):
                     # normalization later assumes a full trailing axis when computing means.
                     if any(pl.dim == params[0].ndim - 1 for _, pl in shard_placements):
                         raise NotImplementedError(
-                            "FracNorMuon currently does not support parameters sharded along the last dimension. "
+                            "TestOptimizer currently does not support parameters sharded along the last dimension. "
                             "Please avoid shards at dim -1."
                         )
 
@@ -307,7 +309,7 @@ class FracNormuon(Optimizer):
                         sharded_tensor_dim = shard_placements[0][1].dim
                     elif len(shard_placements) > 1:
                         raise NotImplementedError(
-                            "FracNormuon does not support parameters with multiple sharded dimensions."
+                            "TestOptimizer does not support parameters with multiple sharded dimensions."
                         )
 
                     # Check that the sharded mesh dimension matches optimizer's device mesh
@@ -332,11 +334,11 @@ class FracNormuon(Optimizer):
 
                         # Create task for non-communicating local update
                         yield AsyncTask(
-                            fracnormuon_update_local_async(
+                            update_local_async(
                                 X=[x],
                                 G=[g],
                                 STATE=st,
-                                **fracnormuon_args,
+                                **testoptimizer_args,
                             )
                         )
                     continue
@@ -345,17 +347,6 @@ class FracNormuon(Optimizer):
                 states = [
                     self._get_or_initialize_dion2_state_layer(p) for p in batch_params
                 ]
-
-                # Create task for communicating batch update
-                yield AsyncTask(
-                    dion2_update_batch_async(
-                        X=pad_batch(batch_params, self._world_size),
-                        G=pad_batch(grads, self._world_size),
-                        STATES=self._pad_states(states, self._world_size),
-                        shard_dim=sharded_tensor_dim,
-                        **fracnormuon_args,
-                    )
-                )
 
     def _create_lion_tasks(
         self,
@@ -446,7 +437,7 @@ class FracNormuon(Optimizer):
             )
 
 
-def fracnormuon_update_local_async(
+def update_local_async(
     X: List[Tensor],
     G: List[Tensor],
     STATE: dict,  # Should put local momentum state here
@@ -467,18 +458,16 @@ def fracnormuon_update_local_async(
     x = X[0]
     # g = to_local(G)[0]  # local shard grad
     M = [STATE["momentum_local"]]  # local shard momentum
-    M_new = fracnormuon_update_pre_orthogonalize(
+    U = adam_update(
         G=to_local(G),
         M=M,
-        momentum=torch.ones_like(momentum),
-        nesterov=False,
-        use_ef_damping=False,
+        V=[STATE["variance_neuron"]], 
+        momentum=momentum,
+        nesterov=nesterov,
+        newton_schulz_func=newton_schulz_func, 
+        flatten=flatten,
+        epsilon=epsilon,
     )
-    U = list(normuon_front_normalization(
-        M_new,
-        V=[STATE["variance_neuron"]],
-        muon_beta2=muon_beta2,
-    ))[0]
 
     if adjust_lr is None:
         adjusted_lr = lr
@@ -489,211 +478,15 @@ def fracnormuon_update_local_async(
     else:
         raise ValueError(f"Unknown adjust_lr value: {adjust_lr}")
 
-    O_local = fractional_orthonormalize_update(
-        M_full=U,
-        ef_M=M[0],
-        fraction=float(fraction),
-        ef_decay=ef_decay, #ef_decay=1
-        flatten=flatten,
-        epsilon=epsilon,
-        newton_schulz_func=newton_schulz_func,
-        interp=False,
-    )
-
     # Apply update locally
     dion2_update_post_orthogonalize(
         X=to_local([x]),
-        U=[O_local],
-        base_lr=lr,
-        adjusted_lr=adjusted_lr,
-        weight_decay=weight_decay,
-    )
-    yield
-
-
-def dion2_update_batch_async(
-    X: List[Tensor],  # DTensors or local Tensors
-    G: List[Tensor],  # local shards (regular Tensors)
-    STATES: List[dict],  # layer-sharded optimizer states (each has 'momentum_full')
-    lr: Tensor,
-    ef_decay: Tensor,
-    fraction: Tensor,
-    weight_decay: Tensor,
-    epsilon: Tensor,
-    flatten: bool,
-    adjust_lr: Optional[str],
-    device_rank: int,
-    world_size: int,
-    shard_dim: Optional[int] = None,
-    process_group: Optional[ProcessGroup] = None,
-    newton_schulz_func: Optional[Callable] = None,
-) -> Generator[None, None, None]:
-    """
-    dion2 layer-sharded path:
-      - Matrix-dim sharded: all_to_all shards <-> full, compute once on owner, all_to_all back.
-      - Replicated/unsharded: compute once on owner (index=device_rank), all_gather dense updates.
-      - Single-GPU (batch size=1): compute once on owner, apply locally.
-    """
-
-    # Ownership-by-index: owner of batch index j is rank j.
-    assert 0 <= device_rank < world_size
-    assert len(X) == len(STATES) == world_size  # Guaranteed by padding
-
-    # convert gradients to local shards
-    G_local = to_local(G)
-    frac = float(fraction)
-
-    # Compute adjusted lr from global shape (matrix dims last)
-    if adjust_lr is None:
-        adjusted_lr = lr
-    elif adjust_lr == "spectral_norm":
-        adjusted_lr = adjust_lr_spectral_norm(lr, X[0].shape, flatten=flatten)
-    elif adjust_lr == "rms_norm":
-        adjusted_lr = adjust_lr_rms_norm(lr, X[0].shape, flatten=flatten)
-    else:
-        raise ValueError(f"Unknown adjust_lr value: {adjust_lr}")
-
-    # Matrix-dimension sharded path
-    if shard_dim is not None:
-        assert len(X) == world_size, "Batch size must equal world size"
-        assert (
-            process_group is not None
-        ), "process_group must be provided for sharded DTensors"
-        assert isinstance(X[0], DTensor), "X should contain DTensors"
-        assert X[0].size(shard_dim) % world_size == 0, (
-            f"Shard dimension {shard_dim} size {X[0].size(shard_dim)} "
-            f"is not divisible by world size {world_size}."
-        )
-
-        # Shards -> single full gradient on owner (bf16 comm)
-        G_bf16 = [g.to(dtype=torch.bfloat16) for g in G_local]
-        recv_shards = [torch.empty_like(g) for g in G_bf16]
-        work = dist.all_to_all(recv_shards, G_bf16, group=process_group, async_op=True)
-        yield
-        work.wait()
-
-        full_grad_bf16 = torch.cat(recv_shards, dim=shard_dim)
-
-        # Ownership-by-index contract:
-        # For layer-sharded path, the "owner" of batch index j is rank j (device_rank).
-        owner_state = STATES[device_rank]
-        owner_is_pad = owner_state.get("is_pad", False)
-
-        # Build the shards to send (bf16), but only do actual work if not "pad"
-        if owner_is_pad:
-            # For pads, do NOT allocate momentum_full or run NS.
-            # Just return zero shards.
-            send_shards = [torch.zeros_like(g) for g in G_bf16]  # bf16 payloads
-        else:
-            # Non-pads: allocate/accumulate, run NS, split to bf16 shards
-            if owner_state["momentum_full"] is None:
-                full_shape, param_dtype, param_device = _full_dtype_and_shape(
-                    X[device_rank]
-                )
-                owner_state["momentum_full"] = torch.zeros(
-                    full_shape, dtype=param_dtype, device=param_device
-                )
-            M_full = owner_state["momentum_full"]
-            full_grad = full_grad_bf16.to(dtype=M_full.dtype)
-            M_full.add_(full_grad)
-
-            O_full = fractional_orthonormalize_update(
-                M_full=M_full,
-                fraction=frac,
-                ef_decay=ef_decay,
-                flatten=flatten,
-                epsilon=epsilon,
-                newton_schulz_func=newton_schulz_func,
-            )
-            # Split back to shards
-            send_shards = [
-                t.contiguous().to(torch.bfloat16)
-                for t in torch.tensor_split(O_full, world_size, dim=shard_dim)
-            ]
-
-        # All-to-all back to shards
-        U = [torch.empty_like(g) for g in G_bf16]
-        work = dist.all_to_all(U, send_shards, group=process_group, async_op=True)
-        yield
-        work.wait()
-
-    # Replicated / unsharded
-    else:
-        # Owner index is device_rank
-        x_owner = X[device_rank]
-        g_owner = G_local[device_rank]
-        st_owner = STATES[device_rank]
-        owner_is_pad = st_owner.get("is_pad", False)
-
-        # Check whether we are in multi-GPU setting
-        multi_gpu = process_group is not None and world_size > 1
-
-        if multi_gpu:
-            # For pads, do not allocate momentum_full or run NS.
-            if owner_is_pad:
-                payload_bf16 = torch.zeros_like(
-                    g_owner, dtype=torch.bfloat16
-                ).contiguous()
-            # Non-pads: allocate/accumulate, run NS, prepare bf16 payload
-            else:
-                if st_owner["momentum_full"] is None:
-                    full_shape, param_dtype, param_device = _full_dtype_and_shape(
-                        x_owner
-                    )
-                    st_owner["momentum_full"] = torch.zeros(
-                        full_shape, dtype=param_dtype, device=param_device
-                    )
-                M_full = st_owner["momentum_full"]
-                M_full.add_(g_owner.to(dtype=M_full.dtype))
-
-                O_full = fractional_orthonormalize_update(
-                    M_full=M_full,
-                    fraction=frac,
-                    ef_decay=ef_decay,
-                    flatten=flatten,
-                    epsilon=epsilon,
-                    newton_schulz_func=newton_schulz_func,
-                )
-                payload_bf16 = O_full.to(dtype=torch.bfloat16).contiguous()
-
-            # All-gather the computed updates
-            U = [torch.empty_like(payload_bf16) for _ in range(world_size)]
-            work = dist.all_gather(U, payload_bf16, group=process_group, async_op=True)
-            yield
-            work.wait()
-
-        else:
-            # Single-GPU case: produce local update directly.
-            # No padding case handling required.
-            if st_owner["momentum_full"] is None:
-                full_shape, param_dtype, param_device = _full_dtype_and_shape(x_owner)
-                st_owner["momentum_full"] = torch.zeros(
-                    full_shape, dtype=param_dtype, device=param_device
-                )
-            M_full = st_owner["momentum_full"]
-            M_full.add_(g_owner.to(dtype=M_full.dtype))
-
-            O_full = fractional_orthonormalize_update(
-                M_full=M_full,
-                fraction=frac,
-                ef_decay=ef_decay,
-                flatten=flatten,
-                epsilon=epsilon,
-                newton_schulz_func=newton_schulz_func,
-            )
-            U = [O_full]
-
-    # Ensure foreach dtypes match parameter shards for the update
-    X_local = to_local(X)
-    U = [u.to(dtype=xi.dtype) for u, xi in zip(U, X_local)]
-
-    dion2_update_post_orthogonalize(
-        X=X_local,
         U=U,
         base_lr=lr,
         adjusted_lr=adjusted_lr,
         weight_decay=weight_decay,
     )
+    yield
 
 
 def make_work_view(M: Tensor) -> Tuple[Tensor, bool]:
@@ -702,117 +495,38 @@ def make_work_view(M: Tensor) -> Tuple[Tensor, bool]:
         return M.mT, True
     return M, False
 
+def psd_inv_sqrt(A: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    A = 0.5 * (A + A.mT)
+    w, Q = torch.linalg.eigh(A)
+    w = w.clamp_min(eps)
+    return (Q * w.rsqrt().unsqueeze(-2)) @ Q.mT
 
-@torch.compile(fullgraph=True)
-def fracnormuon_update_pre_orthogonalize(
+def adam_update(
     G: List[Tensor],
     M: List[Tensor],
+    V: List[Tensor],
     momentum: Tensor,
     nesterov: bool,
-    use_ef_damping: bool, 
+    newton_schulz_func, 
+    flatten,
+    epsilon,
 ) -> List[Tensor]:
-    dtype = M[0].dtype
-    G = [g.to(dtype=dtype) for g in G]
+    V_dtype = V[0].dtype
+    G = [g.to(dtype=V_dtype) for g in G]
+    M = [m.to(dtype=V_dtype) for m in M]
 
-    # Update momentum with new gradient
-    if use_ef_damping:
-        torch._foreach_mul_(M, momentum)
-    torch._foreach_add_(M, G)
+    torch._foreach_mul_(M, momentum)
+    torch._foreach_add_(M, torch._foreach_mul(M, 1.0 - momentum))
 
-    if nesterov:
-        if use_ef_damping:#not too sure how ef damping should interact with nesterov
-            U = torch._foreach_mul(M, momentum)
-        else:
-            U = M
-        torch._foreach_add_(U, G)
-    else:
-        U = M
+    U = []
+    for g, m, v in zip(G, M, V):
+        d = g - m
+        gram = momentum * d.mT @ d              # (J, J)
+        v.mul_(momentum).add_(gram, alpha=(1.0 - momentum))
+        r = torch.linalg.cholesky(v).mT
+        stack = torch.cat((m, r), dim=-1, out=None)
+        w = muon_update_newton_schulz(stack, newton_schulz_func, flatten, epsilon)
+        w_m, w_r = torch.split(w, [m.size(-1), r.size(-1)], dim=-1)
+        U.append(w_m)
 
-    # Convert to bfloat16 before communication
-    U = [u.to(dtype=torch.bfloat16) for u in U]
-
-    return U
-
-def fractional_orthonormalize_update(
-    M_full: Tensor,
-    ef_M: Tensor,
-    fraction: float,
-    ef_decay: Tensor,
-    flatten: bool,
-    epsilon: Tensor,
-    newton_schulz_func: Callable,
-    interp: bool,
-) -> Tensor:
-    M_work, transposed = make_work_view(M_full)
-    ef_M_work, _ = make_work_view(ef_M)
-    I, J = M_work.size(-2), M_work.size(-1)
-    if fraction >= 1.0:
-        # Full orthonormalization
-        ortho_update = muon_update_newton_schulz(
-            M_work, newton_schulz_func, flatten=flatten, epsilon=epsilon
-        )
-        ef_M_work.mul_(ef_decay)
-    else:
-        # Fractional orthonormalization
-        k = int(math.ceil(fraction * J))
-        ortho_update = topk_and_orthonormalize(
-            M_work,
-            ef_M=ef_M_work,
-            ef_decay=ef_decay,
-            k=k,
-            flatten=flatten,
-            epsilon=epsilon,
-            newton_schulz_func=newton_schulz_func,
-            interp=interp,
-        )
-    return ortho_update.mT.contiguous() if transposed else ortho_update
-
-
-def topk_and_orthonormalize(
-    M_work: Tensor,
-    ef_M: Tensor,
-    ef_decay: Tensor,
-    k: int,
-    flatten: bool,
-    epsilon: Tensor,
-    newton_schulz_func,
-    interp: bool,
-) -> Tensor:
-    """ """
-    # Compute the top-k columns by L1 norm
-    alpha = M_work.abs().sum(dim=-2)  # [J]
-    K = torch.topk(alpha, k, sorted=False).indices  # [k]
-    # Select and orthonormalize
-    M_sel = torch.index_select(M_work, dim=-1, index=K)  # [I, k]
-    O_sel = muon_update_newton_schulz(
-        M_sel, newton_schulz_func, flatten=flatten, epsilon=epsilon
-    )
-    # In-place error-feedback decay only on selected columns:
-    ef_M[..., K] *= ef_decay
-    # Construct the full update matrix
-    if interp:
-        O_full = M_work.clone().to(O_sel.dtype) #error feedback doesn't affect since those indices are replaced
-    else:
-        O_full = torch.zeros_like(M_work, dtype=O_sel.dtype)
-    O_full.index_copy_(dim=-1, index=K, source=O_sel)
-    return O_full
-
-
-def dion2_update_post_orthogonalize(
-    X: List[Tensor],
-    U: List[Tensor],
-    base_lr: Tensor,
-    adjusted_lr: Tensor,
-    weight_decay: Tensor,
-):
-    """
-    Apply weight decay and weight update after orthogonalization.
-    Inputs and outputs should be lists of regular Tensor, not DTensor.
-    This is a separate function for compatibility with torch.compile().
-    """
-    # Apply weight decay
-    torch._foreach_mul_(X, 1 - base_lr * weight_decay)
-
-    # Weight update
-    U = torch._foreach_mul(U, adjusted_lr)
-    torch._foreach_sub_(X, U)
+    return M
