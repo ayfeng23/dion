@@ -516,17 +516,24 @@ def adam_update(
     M = [m.to(dtype=V_dtype) for m in M]
 
     torch._foreach_mul_(M, momentum)
-    torch._foreach_add_(M, torch._foreach_mul(M, 1.0 - momentum))
+    torch._foreach_add_(M, G)
 
-    U = []
-    for g, m, v in zip(G, M, V):
+    if nesterov:
+        U = torch._foreach_mul(M, momentum)
+        torch._foreach_add_(U, G)
+    else:
+        U = M
+
+    U_new = []
+    for g, m, v in zip(G, U, V):
         d = g - m
         gram = momentum * d.mT @ d              # (J, J)
         v.mul_(momentum).add_(gram, alpha=(1.0 - momentum))
-        r = torch.linalg.cholesky(v).mT
-        stack = torch.cat((m, r), dim=-1, out=None)
-        w = muon_update_newton_schulz(stack, newton_schulz_func, flatten, epsilon)
-        w_m, w_r = torch.split(w, [m.size(-1), r.size(-1)], dim=-1)
-        U.append(w_m)
+        # r = torch.linalg.cholesky(v).mT
+        # stack = torch.cat((m, r), dim=-1, out=None)
+        # w = muon_update_newton_schulz(stack, newton_schulz_func, flatten, epsilon)
+        # w_m, w_r = torch.split(w, [m.size(-1), r.size(-1)], dim=-1)
+        u = m @ psd_inv_sqrt(m.mT @ m)
+        U_new.append(u)
 
-    return M
+    return U_new
