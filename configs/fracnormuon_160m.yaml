@@ -43,4 +43,7 @@ rank_fraction: 0.5
 scalar_opt: lion
 adjust_lr: spectral_norm
 lr: 0.02
-nesterov: true
+
+nesterov: false
+interp: true
+ef_partial: false

@@ -50,6 +50,8 @@ class FracNormuon(Optimizer):
         weight_decay: float = 0.01,
         epsilon: float = 1e-8,
         nesterov: bool = False,
+        interp: bool = True,
+        ef_partial: bool = True,
         adjust_lr: Optional[str] = "spectral_norm",
         flatten: bool = False,
         use_triton: bool = False,
@@ -60,8 +62,8 @@ class FracNormuon(Optimizer):
             raise ValueError(f"Invalid learning rate: {lr}")
         if mu < 0.0:
             raise ValueError(f"Invalid momentum factor (mu): {mu}")
-        if not (0.0 < fraction <= 1.0):
-            raise ValueError(f"fraction must be in (0, 1], got {fraction}")
+        if not (0.0 <= fraction <= 1.0):
+            raise ValueError(f"fraction must be in [0, 1], got {fraction}")
         if ef_decay < 0.0:
             raise ValueError(f"Invalid error-feedback decay (ef_decay): {ef_decay}")
         if len(betas) != 2 or betas[0] < 0.0 or betas[1] < 0.0:
@@ -82,6 +84,8 @@ class FracNormuon(Optimizer):
             epsilon=epsilon,
             flatten=flatten,
             nesterov=nesterov,
+            interp=interp,
+            ef_partial=ef_partial,
             adjust_lr=adjust_lr,
             algorithm="fracnormuon",
             step=0,
@@ -240,6 +244,8 @@ class FracNormuon(Optimizer):
                 weight_decay=torch.tensor(group["weight_decay"]),
                 epsilon=torch.tensor(group["epsilon"]),
                 nesterov=group["nesterov"],
+                interp=group["interp"],
+                ef_partial=group["ef_partial"],
                 flatten=group["flatten"],
                 adjust_lr=group["adjust_lr"],
                 device_rank=self._device_rank,
@@ -458,6 +464,8 @@ def fracnormuon_update_local_async(
     weight_decay: Tensor,
     epsilon: Tensor,
     nesterov: bool,
+    interp: bool,
+    ef_partial: bool,
     flatten: bool,
     adjust_lr: Optional[str],
     newton_schulz_func: Optional[Callable] = None,
@@ -467,18 +475,26 @@ def fracnormuon_update_local_async(
     x = X[0]
     # g = to_local(G)[0]  # local shard grad
     M = [STATE["momentum_local"]]  # local shard momentum
-    M_new = fracnormuon_update_pre_orthogonalize(
-        G=to_local(G),
-        M=M,
-        momentum=momentum,
-        nesterov=nesterov,
-        use_ef_damping=True,
-    )
-    U = list(normuon_front_normalization(
-        M_new,
-        V=[STATE["variance_neuron"]],
-        muon_beta2=muon_beta2,
-    ))[0]
+    if ef_partial:
+        M_new = fracnormuon_update_pre_orthogonalize(
+            G=to_local(G),
+            M=M,
+            momentum=torch.ones_like(momentum),
+            nesterov=nesterov,
+        )
+    else:
+        M_new = fracnormuon_update_pre_orthogonalize(
+            G=to_local(G),
+            M=M,
+            momentum=momentum,
+            nesterov=nesterov,
+        )
+    U = torch.sign(M_new[0])
+    # U = list(normuon_front_normalization(
+    #     M_new,
+    #     V=[STATE["variance_neuron"]],
+    #     muon_beta2=muon_beta2,
+    # ))[0]
 
     if adjust_lr is None:
         adjusted_lr = lr
@@ -489,14 +505,17 @@ def fracnormuon_update_local_async(
     else:
         raise ValueError(f"Unknown adjust_lr value: {adjust_lr}")
 
+    if not ef_partial:
+        ef_decay = 1
     O_local = fractional_orthonormalize_update(
         M_full=U,
+        ef_M=M[0],
         fraction=float(fraction),
-        ef_decay=1, #we can let ef_decay=1
+        ef_decay=ef_decay,
         flatten=flatten,
         epsilon=epsilon,
         newton_schulz_func=newton_schulz_func,
-        interp=False,
+        interp=interp,
     )
 
     # Apply update locally
@@ -708,21 +727,17 @@ def fracnormuon_update_pre_orthogonalize(
     M: List[Tensor],
     momentum: Tensor,
     nesterov: bool,
-    use_ef_damping: bool, 
 ) -> List[Tensor]:
     dtype = M[0].dtype
     G = [g.to(dtype=dtype) for g in G]
 
     # Update momentum with new gradient
-    if use_ef_damping:
-        torch._foreach_mul_(M, momentum)
-    torch._foreach_add_(M, G)
+    torch._foreach_mul_(M, momentum)
+    # torch._foreach_add_(M, G)
+    torch._foreach_add_(M, torch._foreach_sub(G, torch._foreach_mul(G, momentum)))
 
-    if nesterov:
-        if use_ef_damping:#not too sure how ef damping should interact with nesterov
-            U = torch._foreach_mul(M, momentum)
-        else:
-            U = M
+    if nesterov: #which part should be nesterov updated? Dion doesn't use nesterov. Isn't only w.r.t K?
+        U = torch._foreach_mul(M, momentum)
         torch._foreach_add_(U, G)
     else:
         U = M
@@ -734,6 +749,7 @@ def fracnormuon_update_pre_orthogonalize(
 
 def fractional_orthonormalize_update(
     M_full: Tensor,
+    ef_M: Tensor,
     fraction: float,
     ef_decay: Tensor,
     flatten: bool,
@@ -742,18 +758,20 @@ def fractional_orthonormalize_update(
     interp: bool,
 ) -> Tensor:
     M_work, transposed = make_work_view(M_full)
+    ef_M_work, _ = make_work_view(ef_M)
     I, J = M_work.size(-2), M_work.size(-1)
     if fraction >= 1.0:
         # Full orthonormalization
         ortho_update = muon_update_newton_schulz(
             M_work, newton_schulz_func, flatten=flatten, epsilon=epsilon
         )
-        M_work.mul_(ef_decay)
+        ef_M_work.mul_(ef_decay)
     else:
         # Fractional orthonormalization
         k = int(math.ceil(fraction * J))
         ortho_update = topk_and_orthonormalize(
             M_work,
+            ef_M=ef_M_work,
             ef_decay=ef_decay,
             k=k,
             flatten=flatten,
@@ -766,6 +784,7 @@ def fractional_orthonormalize_update(
 
 def topk_and_orthonormalize(
     M_work: Tensor,
+    ef_M: Tensor,
     ef_decay: Tensor,
     k: int,
     flatten: bool,
@@ -783,7 +802,7 @@ def topk_and_orthonormalize(
         M_sel, newton_schulz_func, flatten=flatten, epsilon=epsilon
     )
     # In-place error-feedback decay only on selected columns:
-    M_work[..., K] *= ef_decay
+    ef_M[..., K] *= ef_decay
     # Construct the full update matrix
     if interp:
         O_full = M_work.clone().to(O_sel.dtype) #error feedback doesn't affect since those indices are replaced

@@ -76,6 +76,10 @@ class Hyperparameters:
     mixed_precision: bool = False
     adjust_lr: str = "spectral_norm"  # for Muon only
 
+    # Austin Fracnormuon Grid Parameters
+    nesterov: bool = True
+    interp: bool = True
+    ef_partial: bool = True
 
 # Helper function to only print on global rank 0
 MASTER_PROCESS = True
@@ -423,7 +427,7 @@ def init_optimizer(
             lr=hp.lr,
             mu=hp.mu,
             weight_decay=hp.weight_decay,
-            nesterov=True,
+            nesterov=hp.nesterov,
             adjust_lr=hp.adjust_lr,
             use_triton=(not cli_args.no_triton),
         )
@@ -476,7 +480,7 @@ def init_optimizer(
             mu=hp.mu,
             muon_beta2=0.95,
             weight_decay=hp.weight_decay,
-            nesterov=True,
+            nesterov=hp.nesterov,
             adjust_lr=hp.adjust_lr,
             use_triton=(not cli_args.no_triton),
         )
@@ -504,7 +508,7 @@ def init_optimizer(
             mu=hp.mu,
             muon_beta2=0.95,
             weight_decay=hp.weight_decay,
-            nesterov=True,
+            nesterov=hp.nesterov,
             adjust_lr=hp.adjust_lr,
             use_triton=(not cli_args.no_triton),
         )
@@ -534,7 +538,9 @@ def init_optimizer(
             ef_decay=hp.mu,
             muon_beta2=0.95,
             weight_decay=hp.weight_decay,
-            nesterov=True,
+            nesterov=hp.nesterov,
+            interp=hp.interp,
+            ef_partial=hp.ef_partial,
             adjust_lr=hp.adjust_lr,
             use_triton=(not cli_args.no_triton),
         )

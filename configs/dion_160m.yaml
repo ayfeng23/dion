@@ -44,3 +44,5 @@ optimizer: dion
 scalar_opt: lion
 lr: 0.02
 mixed_precision: true
+
+nesterov: true

@@ -1,8 +1,8 @@
 
 # — Model —
-model_dim: 768
-n_layer: 12
-n_head: 6
+model_dim: 1024
+n_layer: 24
+n_head: 32
 sequence_length: 1024
 
 # — Batching & Training —
@@ -31,16 +31,15 @@ no_wandb: false
 # — Distributed training —
 dp_size: null      # data‐parallel size
 fs_size: null      # FSDP size
-tp_size: null      # DO NOT USE TP for NorMuon
+tp_size: null     # DO NOT USE TP for Dion2
 
 # — Miscellaneous flags —
 debug: false
 no_compile: false
 no_triton: false
 
-optimizer: normuon_front 
+optimizer: dion2
+rank_fraction: 0.75
 scalar_opt: lion
 adjust_lr: spectral_norm
 lr: 0.02
-
-nesterov: true

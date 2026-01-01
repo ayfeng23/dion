@@ -42,3 +42,5 @@ optimizer: muon
 scalar_opt: lion
 adjust_lr: spectral_norm
 lr: 0.02
+
+nesterov: true
