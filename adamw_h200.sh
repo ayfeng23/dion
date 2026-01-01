@@ -9,6 +9,7 @@
 #SBATCH --mem=64G
 export PATH="$HOME/.local/bin:$PATH"
 source .venv/bin/activate
+module load Python/3.10.8-GCCcore-12.2.0
 
 export WANDB_API_KEY=6847fa93f84b5335cd0ba5f438e6ba60fbe5b76b
 
