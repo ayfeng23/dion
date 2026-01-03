@@ -1,14 +1,14 @@
 
 # — Model —
-model_dim: 768
-n_layer: 12
-n_head: 6
+model_dim: 1024
+n_layer: 24
+n_head: 32
 sequence_length: 1024
 
 # — Batching & Training —
-batch_size: 1024
+batch_size: 2048
 device_batch_size: 32
-num_iterations: 3000
+num_iterations: 4000
 
 # — Learning‐rate schedule —
 warmup_ratio: 0.0
@@ -31,14 +31,14 @@ no_wandb: false
 # — Distributed training —
 dp_size: null      # data‐parallel size
 fs_size: null      # FSDP size
-tp_size: null      # DO NOT USE TP for NorMuon
+tp_size: null      # DO NOT USE TP for Muon
 
 # — Miscellaneous flags —
 debug: false
 no_compile: false
 no_triton: false
 
-optimizer: normuon 
+optimizer: muon 
 scalar_opt: lion
 adjust_lr: spectral_norm
 lr: 0.02

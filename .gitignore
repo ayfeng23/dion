@@ -8,3 +8,6 @@ output/
 .venv/
 submit.ipynb
 aztool/
+dion.egg-info/
+configs/tmp/
+py310-bullseye.sif
