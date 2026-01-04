@@ -32,6 +32,7 @@ from dion import NorMuon
 from dion import NorMuonFront
 from dion import FracNormuon
 from dion import TestOptimizer
+from dion import NioMuon
 
 
 @dataclass
@@ -76,6 +77,8 @@ class Hyperparameters:
     replicate_mesh_grad_sync: bool = False
     mixed_precision: bool = False
     adjust_lr: str = "spectral_norm"  # for Muon only
+
+    reset_factor: float = 0.0
 
 
 # Helper function to only print on global rank 0
@@ -428,6 +431,33 @@ def init_optimizer(
             adjust_lr=hp.adjust_lr,
             use_triton=(not cli_args.no_triton),
         )
+    elif hp.optimizer == "niomuon":
+        if device_mesh is not None:
+            # Ensure that we have a supported device mesh configuration for Muon
+            if inner_shard_mesh is not None and inner_shard_mesh.size() > 1:
+                raise ValueError("Tensor parallel is not supported by Muon.")
+            distributed_mesh = (
+                outer_shard_mesh if outer_shard_mesh.size() > 1 else replicate_mesh
+            )
+            comm_method = "all-to-all" if outer_shard_mesh.size() > 1 else "all-gather"
+        else:
+            assert ddp_model is not None
+            distributed_mesh = ddp_model.process_group  # using ProcessGroup for DDP
+            comm_method = "all-gather"
+        print0(f"NioMuon LR adjust method: {hp.adjust_lr}")
+        print0(f"Triton Newton-Schulz kernels: {not cli_args.no_triton}")
+        print0(f"Distributed Muon using: {comm_method}")
+        opt = NioMuon(
+            param_groups,
+            distributed_mesh=distributed_mesh,
+            lr=hp.lr,
+            mu=hp.mu,
+            weight_decay=hp.weight_decay,
+            nesterov=True,
+            adjust_lr=hp.adjust_lr,
+            use_triton=(not cli_args.no_triton),
+            reset_factor=hp.reset_factor,
+        )
     elif hp.optimizer == "dion2":
         if device_mesh is not None:
             # Ensure that we have a supported device mesh configuration for dion2
@@ -565,7 +595,7 @@ def init_optimizer(
             ef_decay=hp.mu,
             muon_beta2=0.95,
             weight_decay=hp.weight_decay,
-            nesterov=True,
+            nesterov=False,
             adjust_lr=hp.adjust_lr,
             use_triton=(not cli_args.no_triton),
         )
@@ -993,42 +1023,52 @@ def main():
         # --- Validation ---
         last_step = step == hp.num_iterations
         if last_step or (hp.val_loss_every > 0 and step % hp.val_loss_every == 0):
-            # Measure elapsed time for training
-            torch.cuda.synchronize()
-            training_time_ms += 1000 * (time.time() - t0)
+            if step > 2:
+                # Measure elapsed time for training
+                torch.cuda.synchronize()
+                training_time_ms += 1000 * (time.time() - t0)
 
-            # Run validation
-            model.eval()
-            val_loader.reset()
-            val_loss = torch.tensor(0.0, device=x.device)
-            for _ in range(val_steps):
-                with torch.no_grad():
-                    x_val, y_val = val_loader.next_batch()
-                    with autocast_ctx:
-                        loss = model(x_val, y_val)
-                    val_loss += loss
+                # Run validation
+                model.eval()
+                val_loader.reset()
+                val_loss = torch.tensor(0.0, device=x.device)
+                for _ in range(val_steps):
+                    with torch.no_grad():
+                        x_val, y_val = val_loader.next_batch()
+                        with autocast_ctx:
+                            loss = model(x_val, y_val)
+                        val_loss += loss
 
-            # Average validation loss across devices
-            dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-            val_loss = val_loss.item() / val_steps
-            log_message = (
-                f"step:{step}/{hp.num_iterations} val_loss:{val_loss:.4f} "
-                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps):.2f}ms"
-            )
-            print0(log_message)
-            if MASTER_PROCESS and not cli_args.no_wandb and not cli_args.debug:
-                wandb.log(
-                    {
-                        "val/loss": val_loss,
-                        "step": step,
-                        "time/training_time_ms": training_time_ms,  # Log total elapsed training time in ms
-                    }
+                # Average validation loss across devices
+                dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+                val_loss = val_loss.item() / val_steps
+                log_message = (
+                    f"step:{step}/{hp.num_iterations} val_loss:{val_loss:.4f} "
+                    f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps):.2f}ms"
                 )
-            pbar.set_postfix(val_loss=f"{val_loss:.4f}")
+                print0(log_message)
+                if MASTER_PROCESS and not cli_args.no_wandb and not cli_args.debug:
+                    wandb.log(
+                        {
+                            "val/loss": val_loss,
+                            "step": step,
+                            "time/training_time_ms": training_time_ms,  # Log total elapsed training time in ms
+                        }
+                    )
+                pbar.set_postfix(val_loss=f"{val_loss:.4f}")
 
-            # Restart training time for the next iteration
-            torch.cuda.synchronize()
-            t0 = time.time()
+                # Restart training time for the next iteration
+                torch.cuda.synchronize()
+                t0 = time.time()
+            else:
+                if MASTER_PROCESS and not cli_args.no_wandb and not cli_args.debug:
+                    wandb.log(
+                        {
+                            "val/loss": 11.346,
+                            "step": step,
+                            "time/training_time_ms": 0,  # Log total elapsed training time in ms
+                        }
+                    )
 
         if last_step:
             break

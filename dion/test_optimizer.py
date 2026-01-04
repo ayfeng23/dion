@@ -495,11 +495,30 @@ def make_work_view(M: Tensor) -> Tuple[Tensor, bool]:
         return M.mT, True
     return M, False
 
+# def psd_inv_sqrt(A: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+#     A32 = A.float()
+#     w, Q = torch.linalg.eigh(A32)
+#     w = w.clamp_min(eps)
+#     return ((Q * w.rsqrt().unsqueeze(-2)) @ Q.mT).to(A.dtype)
+
 def psd_inv_sqrt(A: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
-    A = 0.5 * (A + A.mT)
-    w, Q = torch.linalg.eigh(A)
-    w = w.clamp_min(eps)
-    return (Q * w.rsqrt().unsqueeze(-2)) @ Q.mT
+    try:
+        A32 = A.float()
+        w, Q = torch.linalg.eigh(A32)
+        w = w.clamp_min(eps)
+        return ((Q * w.rsqrt().unsqueeze(0)) @ Q.mT).to(A.dtype)
+    except RuntimeError:
+        A32 = A.float()
+        n = A32.shape[-1]
+        I = torch.eye(n, device=A.device, dtype=torch.float32)
+        scale = A32.diagonal().mean().clamp_min(1.0)
+        jitter = 1e-6 * scale
+        A32 = A32 + jitter * I
+        w, Q = torch.linalg.eigh(A32)
+        w = w.clamp_min(jitter)
+        return (Q * w.rsqrt().unsqueeze(0)) @ Q.mT
+
+
 
 def adam_update(
     G: List[Tensor],

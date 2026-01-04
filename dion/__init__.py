@@ -9,3 +9,4 @@ from .normuon import NorMuon
 from .normuon_front import NorMuonFront
 from .frac_normuon import FracNormuon
 from .test_optimizer import TestOptimizer
+from .nio_muon import NioMuon

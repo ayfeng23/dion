@@ -38,7 +38,9 @@ debug: false
 no_compile: false
 no_triton: false
 
-optimizer: testoptimizer 
-scalar_opt: adamw
+optimizer: niomuon 
+scalar_opt: lion
 adjust_lr: spectral_norm
-lr: 0.03
+lr: 0.02
+
+reset_factor: 0.0
