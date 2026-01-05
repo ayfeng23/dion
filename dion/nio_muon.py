@@ -14,11 +14,16 @@ from .opt_utils import (
     AsyncRuntime,
     AsyncTask,
     create_param_batches,
+    create_named_batches,
     pad_batch,
+    pad_names,
     to_local,
 )
 from .scalar_opts import adamw_update_foreach_async, lion_update_foreach_async
 
+def print0(*args, **kwargs):
+    if not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0:
+        print(*args, **kwargs, flush=True)
 
 class NioMuon(Optimizer):
     def __init__(
@@ -170,8 +175,16 @@ class NioMuon(Optimizer):
                 p.ndim >= 2 for p in group["params"]
             ), "Muon optimizer only supports matrix parameters."
 
-            group_params = [p for p in group["params"] if p.grad is not None]
-            if not group_params:
+            if "param_names" in group:
+                group_items = [
+                    (p, n)
+                    for p, n in zip(group["params"], group["param_names"])
+                    if p.grad is not None
+                ]
+            else:
+                group_items = [(p, "<unnamed>") for p in group["params"] if p.grad is not None]
+            
+            if not group_items:
                 continue
 
             # Wrap hyperparameters in tensors for torch.compile
@@ -192,9 +205,9 @@ class NioMuon(Optimizer):
             )
 
             # Create batches of parameters of size self._world_size
-            for params in create_param_batches(
-                group_params, batch_size=self._world_size
-            ):
+            for batch in create_named_batches(group_items, batch_size=self._world_size):
+                params = [p for p, _ in batch]
+                names  = [n for _, n in batch]
                 gradients = [p.grad for p in params]
                 states = [self._get_or_initialize_state(p, algo_name) for p in params]
                 momentums = [s["momentum"] for s in states]
@@ -257,12 +270,13 @@ class NioMuon(Optimizer):
                 # As long as matrix dimensions are not sharded, each device will have whole matrices
                 # Each device already has different matrices of the batch, so we can't parallelize further
                 if is_batch_sharded and not is_matrix_sharded:
-                    for x, g, m in zip(params, gradients, momentums):
+                    for x, g, m, n in zip(params, gradients, momentums, names):
                         yield AsyncTask(
                             muon_update_batch_async(
                                 X=[x],
                                 G=[g],
                                 M=[m],
+                                names=[n],
                                 shard_dim=None,  # No sharded matrix dim
                                 **muon_update_args,
                             )
@@ -274,6 +288,7 @@ class NioMuon(Optimizer):
                             X=pad_batch(params, self._world_size),
                             G=pad_batch(gradients, self._world_size),
                             M=pad_batch(momentums, self._world_size),
+                            names=pad_names(names, self._world_size),
                             shard_dim=sharded_tensor_dim,
                             **muon_update_args,
                         )
@@ -368,6 +383,7 @@ def muon_update_batch_async(
     X: List[Tensor],  # Model weights (modified in place)
     G: List[Tensor],  # Gradient
     M: List[Tensor],  # Momentum buffer (modified in place)
+    names: List[str],
     lr: Tensor,  # Learning rate (scalar tensor)
     momentum: Tensor,  # Momentum factor (scalar tensor)
     weight_decay: Tensor,  # Weight decay (scalar tensor)
@@ -394,20 +410,23 @@ def muon_update_batch_async(
 
     G_local = to_local(G)
     M_local = to_local(M)
+    
+    #Non distributed implementation. Must implement a new gm_dot for distributed as G_local contains
+    #parameters from multiple groups, so you shouldn't do += but reduce from all devices. 
     gm_dot = torch.zeros((), device=G_local[0].device)
     for g, m in zip(G_local, M_local):
         gm_dot += torch.sum(g * m)
-
-    # if process_group is not None:
-    #     # print(f"rank {device_rank} entering gm_dot all_reduce", flush=True)
-    #     work = dist.all_reduce(gm_dot, op=dist.ReduceOp.AVG, group=process_group, async_op=True)
-    #     yield
-    #     work.wait()
+    # print0(len(G_local))
 
     loss_increase = gm_dot.item()
-    # if device_rank == 0:
-    #     wandb.log({"train/loss_increase": loss_increase})
-    
+    name = names[0] if names else "<unnamed>"
+    reset = float(loss_increase > 0)
+    if process_group is None or device_rank == 0:
+        wandb.log({
+            f"loss_increase/{name}": loss_increase,
+            f"loss_increase/{name}_reset": reset,
+        }, commit=False)
+
     if loss_increase > 0:
         torch._foreach_mul_(M, reset_factor)
 

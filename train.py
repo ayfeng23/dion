@@ -316,18 +316,34 @@ def init_optimizer(
     if hp.scalar_opt not in ["adamw", "lion"]:
         raise ValueError(f"Unrecognized scalar optimizer: {hp.scalar_opt}")
 
+    name_of = {p: n for n, p in model.named_parameters()}
+    assert len(name_of) == sum(1 for _ in model.parameters())
+
+    params_set = set(model.parameters())
+    for n, p in model.named_parameters():
+        assert p in params_set
+
+    seen = set()
+
     # Separate the model's parameters based on their types
-    matrix_params = list(model.transformer.h.parameters())
-    embedding_params = list(model.transformer.wte.parameters())
-    lm_head_params = list(model.lm_head.parameters())
+    matrix_named = list(model.transformer.h.named_parameters())
+    embedding_named = list(model.transformer.wte.named_parameters())
+    lm_head_named = list(model.lm_head.named_parameters())
+    matrix_params = [p for _, p in matrix_named]
+    embedding_params = [p for _, p in embedding_named]
+    lm_head_params = [p for _, p in lm_head_named]
+    matrix_names = [n for n, _ in matrix_named]
+    embedding_names = [n for n, _ in embedding_named]
+    lm_head_names = [n for n, _ in lm_head_named]
 
     # Matrix params use optimizer default settings
-    param_groups = [dict(params=matrix_params)]
+    param_groups = [dict(params=matrix_params, param_names=matrix_names)]
 
     # Add additional param groups with the necessary configurations for scalar params
     param_groups.append(
         dict(
             params=embedding_params,
+            param_names=embedding_names,
             algorithm=hp.scalar_opt,
             lr=hp.lr,  # no LR adjustment for embedding parameters
             betas=(0.95, 0.98),
@@ -337,12 +353,18 @@ def init_optimizer(
     param_groups.append(
         dict(
             params=lm_head_params,
+            param_names=lm_head_names,
             algorithm=hp.scalar_opt,
             lr=hp.lr / math.sqrt(hp.model_dim),  # scale LR for lm_head
             betas=(0.95, 0.98),
             weight_decay=0,  # no weight decay for lm_head parameters
         )
     )
+
+    for gi, g in enumerate(param_groups):
+        for p in g["params"]:
+            assert p not in seen, f"Param in multiple groups: {name_of.get(p, '<unnamed>')}"
+            seen.add(p)
 
     # Create the main optimizer
     if device_mesh is not None:

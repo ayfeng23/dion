@@ -2,7 +2,7 @@ import torch
 from collections import defaultdict
 from torch import Tensor
 from torch.distributed.tensor import DTensor
-from typing import Generator, List, Optional, Union
+from typing import Generator, List, Optional, Union, Tuple
 
 
 def to_local(tensor: Union[Tensor, List[Tensor]]) -> Union[Tensor, List[Tensor]]:
@@ -64,6 +64,21 @@ def create_param_batches(
             batch = group[i : i + batch_size]
             yield batch
 
+def create_named_batches(
+    items: List[Tuple[Tensor, str]], batch_size: int
+) -> Generator[List[Tuple[Tensor, str]], None, None]:
+    """
+    Batch (param, name) pairs into groups of size `batch_size`.
+    Batching key is taken from the param: (shape, sharding, dtype).
+    """
+    groups = defaultdict(list)
+    for p, name in items:
+        sharding = p.placements if isinstance(p, DTensor) else None
+        groups[(p.shape, sharding, p.dtype)].append((p, name))
+
+    for group in groups.values():
+        for i in range(0, len(group), batch_size):
+            yield group[i : i + batch_size]
 
 def pad_batch(batch: List[Tensor], batch_size: int) -> List[Tensor]:
     """
@@ -75,6 +90,16 @@ def pad_batch(batch: List[Tensor], batch_size: int) -> List[Tensor]:
         batch.append(torch.empty_like(batch[0]))
     return batch
 
+def pad_names(names: List[str], batch_size: int) -> List[str]:
+    """
+    Insert dummy names so the batch has exactly `batch_size` elements.
+    Mirrors pad_batch semantics.
+    """
+    assert len(names) > 0
+    assert len(names) <= batch_size
+    while len(names) < batch_size:
+        names.append("<pad>")
+    return names
 
 class AsyncTask:
     """

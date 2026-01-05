@@ -2,12 +2,12 @@
 #SBATCH --job-name=niomuon_grid
 #SBATCH --output=logs/h200_niomuon_grid_%a.out
 #SBATCH --error=logs/h200_niomuon_grid_%a.err
-#SBATCH --time=3:00:00
+#SBATCH --time=16:00:00
 #SBATCH --partition=gpu_h200
 #SBATCH --cpus-per-gpu=8
 #SBATCH --gpus=h200:1
 #SBATCH --mem=64G
-#SBATCH --array=0-1
+#SBATCH --array=0-3
 
 export PATH="$HOME/.local/bin:$PATH"
 
@@ -16,8 +16,8 @@ module load Python/3.10.8-GCCcore-12.2.0
 source .venv/bin/activate
 
 # -------- Grid --------
-LRS=(0.04)
-RESET_FACTORS=(0 1.0)
+LRS=(0.04 0.02)
+RESET_FACTORS=(0 0.5)
 
 # Map SLURM_ARRAY_TASK_ID -> (lr_idx, rf_idx)
 NUM_RF=${#RESET_FACTORS[@]}
@@ -40,7 +40,7 @@ mkdir -p logs configs/tmp
 TMP_CONFIG="configs/tmp/niomuon_lr${MY_LR}_rf${MY_RF}_${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}.yaml"
 
 # Start from your base config
-cp configs/niomuon_160m.yaml "$TMP_CONFIG"
+cp configs/niomuon_350m.yaml "$TMP_CONFIG"
 
 # -------- Edit config --------
 # 1) set algorithm to niomuon (assumes a line like: algorithm: something)
