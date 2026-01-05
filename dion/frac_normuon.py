@@ -50,7 +50,7 @@ class FracNormuon(Optimizer):
         weight_decay: float = 0.01,
         epsilon: float = 1e-8,
         nesterov: bool = False,
-        interp: bool = True,
+        interp: float = 1.0,
         ef_partial: bool = True,
         adjust_lr: Optional[str] = "spectral_norm",
         flatten: bool = False,
@@ -464,7 +464,7 @@ def fracnormuon_update_local_async(
     weight_decay: Tensor,
     epsilon: Tensor,
     nesterov: bool,
-    interp: bool,
+    interp: float,
     ef_partial: bool,
     flatten: bool,
     adjust_lr: Optional[str],
@@ -755,7 +755,7 @@ def fractional_orthonormalize_update(
     flatten: bool,
     epsilon: Tensor,
     newton_schulz_func: Callable,
-    interp: bool,
+    interp: float,
 ) -> Tensor:
     M_work, transposed = make_work_view(M_full)
     ef_M_work, _ = make_work_view(ef_M)
@@ -790,7 +790,7 @@ def topk_and_orthonormalize(
     flatten: bool,
     epsilon: Tensor,
     newton_schulz_func,
-    interp: bool,
+    interp: float,
 ) -> Tensor:
     """ """
     # Compute the top-k columns by L1 norm
@@ -804,10 +804,12 @@ def topk_and_orthonormalize(
     # In-place error-feedback decay only on selected columns:
     ef_M[..., K] *= ef_decay
     # Construct the full update matrix
-    if interp:
-        O_full = M_work.clone().to(O_sel.dtype) #error feedback doesn't affect since those indices are replaced
-    else:
-        O_full = torch.zeros_like(M_work, dtype=O_sel.dtype)
+
+    O_full = M_work.clone().to(O_sel.dtype) * interp
+    # if interp:
+    #     O_full = M_work.clone().to(O_sel.dtype) #error feedback doesn't affect since those indices are replaced
+    # else:
+    #     O_full = torch.zeros_like(M_work, dtype=O_sel.dtype)
     O_full.index_copy_(dim=-1, index=K, source=O_sel)
     return O_full
 

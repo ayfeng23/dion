@@ -78,7 +78,7 @@ class Hyperparameters:
 
     # Austin Fracnormuon Grid Parameters
     nesterov: bool = True
-    interp: bool = True
+    interp: float = 1.0
     ef_partial: bool = True
 
 # Helper function to only print on global rank 0

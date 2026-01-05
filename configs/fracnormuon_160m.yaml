@@ -45,5 +45,5 @@ adjust_lr: spectral_norm
 lr: 0.02
 
 nesterov: false
-interp: true
+interp: 0.1
 ef_partial: false
