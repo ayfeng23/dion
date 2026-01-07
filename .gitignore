@@ -8,3 +8,8 @@ output/
 .venv/
 submit.ipynb
 aztool/
+py310-bullseye.sif
+checkpoints/
+configs/tmp/
+dion.egg-info/
+dion/nio_muon_bad.py

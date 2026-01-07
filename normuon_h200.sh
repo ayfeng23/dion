@@ -13,6 +13,6 @@ module load Python/3.10.8-GCCcore-12.2.0
 
 export WANDB_API_KEY=6847fa93f84b5335cd0ba5f438e6ba60fbe5b76b
 
-CONFIG="configs/normuon_350m.yaml"
+CONFIG="configs/normuon_160m.yaml"
 
-torchrun --standalone --nproc_per_node=1 train.py --config $CONFIG
+torchrun --standalone --nproc_per_node=1 train.py --config $CONFIG #--checkpoint_dir checkpoints/normuon_350m --checkpoint_freq 400

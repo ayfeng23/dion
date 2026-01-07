@@ -31,14 +31,16 @@ no_wandb: false
 # — Distributed training —
 dp_size: null      # data‐parallel size
 fs_size: null      # FSDP size
-tp_size: null      # DO NOT USE TP for Muon
+tp_size: null      # DO NOT USE TP for NorMuon
 
 # — Miscellaneous flags —
 debug: false
 no_compile: false
 no_triton: false
 
-optimizer: muon 
+optimizer: nionormuon 
 scalar_opt: lion
 adjust_lr: spectral_norm
-lr: 0.04
+lr: 0.02
+
+reset_factor: 0.0

@@ -33,6 +33,7 @@ from dion import NorMuonFront
 from dion import FracNormuon
 from dion import TestOptimizer
 from dion import NioMuon
+from dion import NioNorMuon
 
 
 @dataclass
@@ -110,6 +111,19 @@ def parse_cli_args():
         type=str,
         default=None,
         help="Directory to load and save checkpoints",
+    )
+    parser.add_argument(
+        "--resume_name",
+        type=str,
+        default="latest",
+        help="Checkpoint subdir name to load (e.g. latest or step_0004000). Set to '' to disable loading.",
+    )
+    parser.add_argument(
+        "--optimizer_switch_mode",
+        type=str,
+        default="off",
+        choices=["auto", "off"],
+        help="auto: post-load fixup for muon/normuon family optimizer group metadata; off: do nothing.",
     )
     parser.add_argument(
         "--checkpoint_freq",
@@ -449,7 +463,7 @@ def init_optimizer(
             lr=hp.lr,
             mu=hp.mu,
             weight_decay=hp.weight_decay,
-            nesterov=True,
+            nesterov=False,
             adjust_lr=hp.adjust_lr,
             use_triton=(not cli_args.no_triton),
         )
@@ -475,7 +489,7 @@ def init_optimizer(
             lr=hp.lr,
             mu=hp.mu,
             weight_decay=hp.weight_decay,
-            nesterov=True,
+            nesterov=False,
             adjust_lr=hp.adjust_lr,
             use_triton=(not cli_args.no_triton),
             reset_factor=hp.reset_factor,
@@ -529,9 +543,38 @@ def init_optimizer(
             mu=hp.mu,
             muon_beta2=0.95,
             weight_decay=hp.weight_decay,
-            nesterov=True,
+            nesterov=False,
             adjust_lr=hp.adjust_lr,
             use_triton=(not cli_args.no_triton),
+        )
+
+    elif hp.optimizer == "nionormuon":
+        if device_mesh is not None:
+            # Ensure that we have a supported device mesh configuration for NorMuon
+            if inner_shard_mesh is not None and inner_shard_mesh.size() > 1:
+                raise ValueError("Tensor parallel is not supported by NorMuon.")
+            distributed_mesh = (
+                outer_shard_mesh if outer_shard_mesh.size() > 1 else replicate_mesh
+            )
+            comm_method = "all-to-all" if outer_shard_mesh.size() > 1 else "all-gather"
+        else:
+            assert ddp_model is not None
+            distributed_mesh = ddp_model.process_group  # using ProcessGroup for DDP
+            comm_method = "all-gather"
+        print0(f"NioNorMuon LR adjust method: {hp.adjust_lr}")
+        print0(f"Triton Newton-Schulz kernels: {not cli_args.no_triton}")
+        print0(f"Distributed NorMuon using: {comm_method}")
+        opt = NioNorMuon(
+            param_groups,
+            distributed_mesh=distributed_mesh,
+            lr=hp.lr,
+            mu=hp.mu,
+            muon_beta2=0.95,
+            weight_decay=hp.weight_decay,
+            nesterov=False,
+            adjust_lr=hp.adjust_lr,
+            use_triton=(not cli_args.no_triton),
+            reset_factor=hp.reset_factor,
         )
 
     elif hp.optimizer == "normuon_front":
@@ -557,7 +600,7 @@ def init_optimizer(
             mu=hp.mu,
             muon_beta2=0.95,
             weight_decay=hp.weight_decay,
-            nesterov=True,
+            nesterov=False,
             adjust_lr=hp.adjust_lr,
             use_triton=(not cli_args.no_triton),
         )
@@ -587,7 +630,7 @@ def init_optimizer(
             ef_decay=hp.mu,
             muon_beta2=0.95,
             weight_decay=hp.weight_decay,
-            nesterov=True,
+            nesterov=False,
             adjust_lr=hp.adjust_lr,
             use_triton=(not cli_args.no_triton),
         )
@@ -641,7 +684,7 @@ def init_optimizer(
             lr=hp.lr,
             mu=hp.mu,
             weight_decay=hp.weight_decay,
-            nesterov=True,
+            nesterov=False,
             adjust_lr=hp.adjust_lr,
         )
 
@@ -670,6 +713,39 @@ def init_optimizer(
         print0("Warning: not using replicate_mesh_grad_sync for Dion optimizer")
 
     return opt
+
+
+def _fixup_optimizer_groups_for_switch(optimizer, hp, cli_args):
+    """
+    Assumptions:
+      - per-parameter optimizer state keys are compatible (e.g., 'momentum', 'variance')
+      - you are NOT switching from NIO -> non-NIO, and NOT cross-family (muon <-> normuon)
+    """
+    if getattr(cli_args, "optimizer_switch_mode", "auto") == "off":
+        return
+    target = getattr(hp, "optimizer", None)
+    if target not in ("niomuon", "nionormuon"):
+        return 
+
+    if target == "niomuon":
+        wanted_algo = "niomuon"
+        allowed_source_algos = {"muon", "niomuon"}  # tolerate already-fixed checkpoints
+    else:  # target == "nionormuon"
+        wanted_algo = "nionormuon"
+        allowed_source_algos = {"normuon", "nionormuon"}
+
+    rf = float(getattr(hp, "reset_factor", 0.0))
+    if MASTER_PROCESS:
+        print0(f"[optimizer switch] applying reset_factor = {rf}")
+
+    for g in optimizer.param_groups:
+        algo = g.get("algorithm", None)
+
+        if algo not in allowed_source_algos:
+            continue
+
+        g["algorithm"] = wanted_algo
+        g.setdefault("reset_factor", rf)
 
 
 class CheckpointManager:
@@ -981,16 +1057,25 @@ def main():
         f"Checkpoint frequency: {hp.checkpoint_freq if hp.checkpoint_freq > 0 else 'disabled'}"
     )
 
-    # Load the latest checkpoint if it exists
-    if hp.checkpoint_dir:
-        checkpoint_manager.load(allow_missing=True)
+    if hp.checkpoint_dir and cli_args.resume_name:
+        checkpoint_manager.load(name=cli_args.resume_name, allow_missing=True)
         if checkpoint_manager.step is not None:
-            print0(f"Resuming from step {checkpoint_manager.step}")
+            print0(f"Loaded checkpoint {cli_args.resume_name} at step {checkpoint_manager.step}")
         else:
-            print0("No previous checkpoint found, training model from scratch")
+            print0(f"No checkpoint found for {cli_args.resume_name}, training from scratch")
     else:
-        # No checkpoint path provided
         print0("Training model from scratch")
+
+    # # Load the latest checkpoint if it exists
+    # if hp.checkpoint_dir:
+    #     checkpoint_manager.load(allow_missing=True)
+    #     if checkpoint_manager.step is not None:
+    #         print0(f"Resuming from step {checkpoint_manager.step}")
+    #     else:
+    #         print0("No previous checkpoint found, training model from scratch")
+    # else:
+    #     # No checkpoint path provided
+    #     print0("Training model from scratch")
 
     print0("=" * 80)
 
@@ -1032,6 +1117,11 @@ def main():
     autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
 
     start_step = 0 if checkpoint_manager.step is None else checkpoint_manager.step + 1
+    if checkpoint_manager.step is not None:
+        # Align scheduler with the loaded global step so the next lr_scheduler.step()
+        # corresponds to step = checkpoint_manager.step + 1
+        lr_scheduler.last_epoch = checkpoint_manager.step
+    
     pbar = tqdm(total=hp.num_iterations, desc="Training", disable=not MASTER_PROCESS)
     pbar.update(start_step)
     for step in range(start_step, hp.num_iterations + 1):
@@ -1132,6 +1222,7 @@ def main():
         lr_scheduler.step()
         model.zero_grad(set_to_none=True)
 
+        current_lr = optimizer.param_groups[0]["lr"]
         # Approximate updated training time just before logging
         approx_time = training_time_ms + 1000 * (time.time() - t0)
         if MASTER_PROCESS and not cli_args.no_wandb and not cli_args.debug:
@@ -1139,6 +1230,7 @@ def main():
                 {
                     "train/loss": train_loss.item(),
                     "train/grad_norm": grad_norm.item(),
+                    "train/lr": current_lr,
                     "step": step,
                     "time/training_time_ms": approx_time,  # Log approximate elapsed training time in ms
                 }
@@ -1159,7 +1251,8 @@ def main():
                 optimizer.synchronize_for_checkpoint()
 
             # Save a distributed checkpoint
-            checkpoint_manager.save(step=step)
+            checkpoint_manager.save(name=f"step_{step:04d}", step=step)
+            checkpoint_manager.save(name="latest", step=step)
 
         torch.cuda.synchronize()
         t0 = time.time()  # reset timer after optimizer step

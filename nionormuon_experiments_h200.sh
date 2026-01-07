@@ -1,13 +1,13 @@
 #!/bin/bash
-#SBATCH --job-name=niomuon_grid
-#SBATCH --output=logs/h200_niomuon_grid_%a.out
-#SBATCH --error=logs/h200_niomuon_grid_%a.err
+#SBATCH --job-name=nionormuon_grid
+#SBATCH --output=logs/h200_nionormuon_grid_%a.out
+#SBATCH --error=logs/h200_nionormuon_grid_%a.err
 #SBATCH --time=3:00:00
 #SBATCH --partition=gpu_h200
 #SBATCH --cpus-per-gpu=8
 #SBATCH --gpus=h200:1
 #SBATCH --mem=64G
-#SBATCH --array=0-1
+#SBATCH --array=0-3
 
 export PATH="$HOME/.local/bin:$PATH"
 
@@ -16,7 +16,7 @@ module load Python/3.10.8-GCCcore-12.2.0
 source .venv/bin/activate
 
 # -------- Grid --------
-LRS=(0.02)
+LRS=(0.02 0.04)
 RESET_FACTORS=(0.0 0.5)
 
 # Map SLURM_ARRAY_TASK_ID -> (lr_idx, rf_idx)
@@ -33,18 +33,18 @@ echo "Task ${SLURM_ARRAY_TASK_ID}: lr=${MY_LR}, reset_factor=${MY_RF}"
 # Better: export this in your shell or a secrets file, not hardcoded in the script.
 export WANDB_API_KEY=6847fa93f84b5335cd0ba5f438e6ba60fbe5b76b
 export WANDB_RUN_GROUP="Test Optimizer"
-export WANDB_NAME="niomuon_lr${MY_LR}_rf${MY_RF}_job${SLURM_ARRAY_JOB_ID}_task${SLURM_ARRAY_TASK_ID}"
+export WANDB_NAME="nionormuon_lr${MY_LR}_rf${MY_RF}_job${SLURM_ARRAY_JOB_ID}_task${SLURM_ARRAY_TASK_ID}"
 
 mkdir -p logs configs/tmp
 
-TMP_CONFIG="configs/tmp/niomuon_lr${MY_LR}_rf${MY_RF}_${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}.yaml"
+TMP_CONFIG="configs/tmp/nionormuon_lr${MY_LR}_rf${MY_RF}_${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}.yaml"
 
 # Start from your base config
-cp configs/niomuon_160m.yaml "$TMP_CONFIG"
+cp configs/nionormuon_160m.yaml "$TMP_CONFIG"
 
 # -------- Edit config --------
 # 1) set algorithm to niomuon (assumes a line like: algorithm: something)
-sed -i "s/^algorithm:.*/algorithm: niomuon/" "$TMP_CONFIG"
+sed -i "s/^algorithm:.*/algorithm: nionormuon/" "$TMP_CONFIG"
 
 # 2) set lr (assumes a line like: lr: 0.0004 etc.)
 sed -i "s/^lr:.*/lr: ${MY_LR}/" "$TMP_CONFIG"
