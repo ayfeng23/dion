@@ -11,3 +11,5 @@ aztool/
 dion.egg-info/
 configs/tmp/
 py310-bullseye.sif
+checkpoints/
+dion/nio_muon_bad.py
