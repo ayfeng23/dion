@@ -272,7 +272,7 @@ class NioMuon(Optimizer):
                 if is_batch_sharded and not is_matrix_sharded:
                     for x, g, m, n in zip(params, gradients, momentums, names):
                         yield AsyncTask(
-                            muon_update_batch_async(
+                            niomuon_update_batch_async(
                                 X=[x],
                                 G=[g],
                                 M=[m],
@@ -284,7 +284,7 @@ class NioMuon(Optimizer):
                 # Otherwise, we parallelize the Muon update across devices
                 else:
                     yield AsyncTask(
-                        muon_update_batch_async(
+                        niomuon_update_batch_async(
                             X=pad_batch(params, self._world_size),
                             G=pad_batch(gradients, self._world_size),
                             M=pad_batch(momentums, self._world_size),
@@ -543,6 +543,115 @@ def muon_update_batch_async(
         weight_decay=weight_decay,
         cautious_wd=cautious_wd,
     )
+
+
+def niomuon_update_batch_async(
+    X: List[Tensor],  # Model weights (modified in place)
+    G: List[Tensor],  # Gradient
+    M: List[Tensor],  # Momentum buffer (modified in place)
+    names: List[str],
+    lr: Tensor,  # Learning rate (scalar tensor)
+    momentum: Tensor,  # Momentum factor (scalar tensor)
+    weight_decay: Tensor,  # Weight decay (scalar tensor)
+    epsilon: Tensor,  # Epsilon (scalar tensor)
+    nesterov: bool,  # Whether to use Nesterov momentum
+    flatten: bool,  # Whether to flatten 3D+ tensors to 2D
+    adjust_lr: Optional[str],  # How to adjust learning rate
+    device_rank: int,  # Rank of the current device
+    world_size: int,  # Total number of devices to parallelize over
+    shard_dim: Optional[int] = None,  # Shard dimension for DTensor (if applicable)
+    process_group: Optional[ProcessGroup] = None,
+    newton_schulz_func: Optional[Callable] = None,
+    cautious_wd: bool = False,
+    reset_factor: float = 0.0,
+) -> Generator[None, None, None]:
+    """
+    Batched version of Muon update. Batch size should be equal to number of GPUs.
+    All tensors in a batch should have identical shape, sharding, and dtype.
+    Identical hyperparameters are used for all tensors in the batch.
+    """
+
+    assert len(X) == len(G)
+    assert len(X) == len(M)
+
+    # Get one whole matrix for each device to orthogonalize
+    U = []
+    if shard_dim is not None:
+        # Use all-to-all to transform from a batch of shards to a single whole matrix
+        # https://www.essential.ai/blog/infra
+        assert False
+
+    # Matrices are not sharded, so we can distribute the batch across different devices
+    # Get a single matrix of the batch corresponding to this device
+    elif len(M) > 1:
+        assert False
+        yield #to support the async
+
+    # Single tensor with no sharded dimension. This happens in 2 cases:
+    # - Running on a single GPU
+    # - 3D+ tensors sharded along a batch dimension (different whole matrices per device)
+    else:
+        assert len(M) == 1
+        U.append(muon_update_newton_schulz(
+            M[0],
+            newton_schulz_func=newton_schulz_func,
+            flatten=flatten,
+            epsilon=epsilon,
+        ))
+
+    # Compute scaled learning rate
+    # Do this before to_local(X) because we use the full tensor shape, not the shard shape
+    if adjust_lr is None:
+        adjusted_lr = lr
+    elif adjust_lr == "spectral_norm":
+        adjusted_lr = adjust_lr_spectral_norm(lr, X[0].shape, flatten=flatten)
+    elif adjust_lr == "rms_norm":
+        adjusted_lr = adjust_lr_rms_norm(lr, X[0].shape, flatten=flatten)
+    else:
+        raise ValueError(f"Unknown adjust_lr value: {adjust_lr}")
+
+    # Update model parameters with orthogonalized output
+    muon_update_post_orthogonalize(
+        X=to_local(X),
+        U=U,
+        base_lr=lr,
+        adjusted_lr=adjusted_lr,
+        weight_decay=weight_decay,
+        cautious_wd=cautious_wd,
+    )
+    
+    G_local = to_local(G)
+    M_local = to_local(M)
+    U_local = to_local(U)
+    
+    #Non distributed implementation. Must implement a new gm_dot for distributed as G_local contains
+    #parameters from multiple groups, so you shouldn't do += but reduce from all devices. 
+    gm_dot = torch.zeros((), device=G_local[0].device)
+    for g, u in zip(G_local, U_local):
+        gm_dot += torch.sum(g * u)
+    # print0(len(G_local))
+
+    loss_increase = gm_dot.item()
+    name = names[0] if names else "<unnamed>"
+    reset = float(loss_increase < 0)
+    if process_group is None or device_rank == 0:
+        wandb.log({
+            f"loss_increase/{name}": loss_increase,
+            f"loss_increase/{name}_reset": reset,
+        }, commit=False)
+
+    if loss_increase < 0:
+        torch._foreach_mul_(M, reset_factor)
+
+    # Update momentum and compute the inputs for orthogonalization
+    assert nesterov == False
+    muon_update_pre_orthogonalize(
+        G=to_local(G),
+        M=to_local(M),
+        momentum=momentum,
+        nesterov=nesterov,
+    )
+
 
 
 @torch.compile(fullgraph=True)

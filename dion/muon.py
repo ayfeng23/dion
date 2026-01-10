@@ -551,7 +551,7 @@ def muon_update_pre_orthogonalize(
     torch._foreach_mul_(M, momentum)
     torch._foreach_add_(M, G)
 
-    if nesterov:
+    if nesterov: #if using muon, this is just different gamma
         U = torch._foreach_mul(M, momentum)
         torch._foreach_add_(U, G)
     else:
