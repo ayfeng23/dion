@@ -39,7 +39,7 @@ no_compile: false
 no_triton: false
 
 optimizer: dion2
-rank_fraction: 0.75
+ortho_fraction: 0.75
 scalar_opt: lion
 adjust_lr: spectral_norm
 lr: 0.02

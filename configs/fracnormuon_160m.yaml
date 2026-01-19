@@ -39,11 +39,11 @@ no_compile: false
 no_triton: false
 
 optimizer: fracnormuon
-rank_fraction: 0.5
+ortho_fraction: 0.75
 scalar_opt: lion
 adjust_lr: spectral_norm
 lr: 0.02
 
-nesterov: false
 interp: 0.1
 ef_partial: false
+partial_warmup: true

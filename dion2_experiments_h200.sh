@@ -2,7 +2,7 @@
 #SBATCH --job-name=dion2_experiments
 #SBATCH --output=logs/h200_dion2_fraction_%a.out 
 #SBATCH --error=logs/h200_dion2_fraction_%a.err
-#SBATCH --time=16:00:00
+#SBATCH --time=2:00:00
 #SBATCH --partition=gpu_h200
 #SBATCH --cpus-per-gpu=8
 #SBATCH --gpus=h200:1
@@ -12,7 +12,7 @@ export PATH="$HOME/.local/bin:$PATH"
 source .venv/bin/activate
 module load Python/3.10.8-GCCcore-12.2.0
 
-FRACTIONS=(0.75)
+FRACTIONS=(0.5)
 export WANDB_API_KEY=6847fa93f84b5335cd0ba5f438e6ba60fbe5b76b
 
 MY_FRACTION=${FRACTIONS[$SLURM_ARRAY_TASK_ID]}
@@ -20,10 +20,10 @@ MY_FRACTION=${FRACTIONS[$SLURM_ARRAY_TASK_ID]}
 mkdir -p configs/tmp
 TMP_CONFIG="configs/tmp/frac_${MY_FRACTION}_${SLURM_ARRAY_JOB_ID}.yaml"
 
-# Use sed to replace the rank_fraction value
-sed "s/rank_fraction:.*/rank_fraction: $MY_FRACTION/" configs/dion2_350m.yaml > $TMP_CONFIG
+# Use sed to replace the ortho_fraction value
+sed "s/ortho_fraction:.*/ortho_fraction: $MY_FRACTION/" configs/dion2_160m.yaml > $TMP_CONFIG
 
-echo "Task ID $SLURM_ARRAY_TASK_ID starting with rank_fraction: $MY_FRACTION"
+echo "Task ID $SLURM_ARRAY_TASK_ID starting with ortho_fraction: $MY_FRACTION"
 
 torchrun --standalone --nproc_per_node=1 train.py --config $TMP_CONFIG
 

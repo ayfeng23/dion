@@ -80,6 +80,7 @@ class Hyperparameters:
     nesterov: bool = True
     interp: float = 1.0
     ef_partial: bool = True
+    partial_warmup: bool = True
 
     # For printing out selection choice in Dion2
     verbose: bool = True
@@ -532,16 +533,17 @@ def init_optimizer(
             param_groups,
             distributed_mesh=distributed_mesh,
             lr=hp.lr,
-            mu=hp.mu,
-            fraction=hp.rank_fraction,
+            fraction=hp.ortho_fraction,
             ef_decay=hp.mu,
             muon_beta2=0.95,
             weight_decay=hp.weight_decay,
-            nesterov=hp.nesterov,
             interp=hp.interp,
             ef_partial=hp.ef_partial,
+            partial_warmup=hp.partial_warmup,
             adjust_lr=hp.adjust_lr,
             use_triton=(not cli_args.no_triton),
+            warmup_cutoff=round(hp.warmup_ratio * hp.num_iterations), #check off by one later
+            # verbose=True,
         )
 
     elif hp.optimizer == "dion_simple":
@@ -1044,6 +1046,7 @@ def main():
         optimizer.step()
         lr_scheduler.step()
         model.zero_grad(set_to_none=True)
+        current_lr = optimizer.param_groups[0]["lr"]
 
         # Approximate updated training time just before logging
         approx_time = training_time_ms + 1000 * (time.time() - t0)
@@ -1052,6 +1055,7 @@ def main():
                 {
                     "train/loss": train_loss.item(),
                     "train/grad_norm": grad_norm.item(),
+                    "train/lr": current_lr,
                     "step": step,
                     "time/training_time_ms": approx_time,  # Log approximate elapsed training time in ms
                 }

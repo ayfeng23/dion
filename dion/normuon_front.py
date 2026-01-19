@@ -22,7 +22,7 @@ from .scalar_opts import adamw_update_foreach_async, lion_update_foreach_async
 from .muon import (
     muon_update_newton_schulz,
     muon_update_post_orthogonalize,
-    muon_update_pre_orthogonalize,
+    # muon_update_pre_orthogonalize,
     zeropower_via_newtonschulz5,
     adjust_lr_spectral_norm,
     adjust_lr_rms_norm,
@@ -463,8 +463,9 @@ def normuon_front_update_batch_async(
     # Removed Newton Schuz Orthogonalization 
     
     # NorMuon Front normalization, removed the rescaling
-    U = list(normuon_front_normalization(
-        M_new,
+    U = list(normuon_front_second_moment(
+        G=to_local(G),
+        M_new=M_new,
         V=to_local(V),
         muon_beta2=muon_beta2,
     ))
@@ -582,21 +583,23 @@ def normuon_front_update_batch_async(
 
 
 @torch.compile(fullgraph=True)
-def normuon_front_normalization(
+def normuon_front_second_moment(
+    G: List[Tensor],
     M_new: List[Tensor],
     V: List[Tensor],
     muon_beta2: Tensor,
 ) -> List[Tensor]:
     """
-    NorMuon normalization step after orthogonalization.
+    NorMuon second moment step after orthogonalization.
     Inputs and outputs should be lists of regular Tensor, not DTensor.
     This is a separate function for compatibility with torch.compile().
     """
     V_dtype = V[0].dtype
     M_new = [m_new.to(dtype=V_dtype) for m_new in M_new]
+    G_adj = [g.to(dtype=V_dtype) for g in G]
 
-    M_new_sq = torch._foreach_mul(M_new, M_new)  # list of m*m, same shapes as M_new
-    neuron_norms = [m_new_sq.mean(dim=-1, keepdim=True) for m_new_sq in M_new_sq]  # Shape: [*, 1]
+    G_sq = torch._foreach_mul(G_adj, G_adj)  # list of g*g, same shapes as G_adj
+    neuron_norms = [g_sq.mean(dim=-1, keepdim=True) for g_sq in G_sq]  # Shape: [*, 1]
     torch._foreach_lerp_(
         V, neuron_norms, 1 - muon_beta2
     )  # Update variance neuron buffer
@@ -604,5 +607,38 @@ def normuon_front_normalization(
     denom = torch._foreach_sqrt(V)  # list of sqrt(v)
     torch._foreach_add_(denom, 1e-8)  # denom[i] += 1e-8
     normalized_U = torch._foreach_div(M_new, denom)  # list of u / denom
+    normalized_U = [u.to(dtype=torch.bfloat16) for u in normalized_U]
     return normalized_U
 
+
+
+
+@torch.compile(fullgraph=True)
+def muon_update_pre_orthogonalize(
+    G: List[Tensor],
+    M: List[Tensor],
+    momentum: Tensor,
+    nesterov: bool,
+) -> List[Tensor]:
+    """
+    Update momentum with gradient and compute the input to orthogonalization.
+    Inputs and outputs should be lists of regular Tensor, not DTensor.
+    This is a separate function for compatibility with torch.compile().
+    """
+    dtype = M[0].dtype
+    G = [g.to(dtype=dtype) for g in G]
+
+    # Update momentum with new gradient
+    torch._foreach_mul_(M, momentum)
+    torch._foreach_add_(M, G)
+
+    if nesterov:
+        U = torch._foreach_mul(M, momentum)
+        torch._foreach_add_(U, G)
+    else:
+        U = M
+
+    # Convert to bfloat16 before communication
+    U = [u.to(dtype=torch.bfloat16) for u in U]
+
+    return U
