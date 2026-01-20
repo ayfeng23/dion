@@ -43,4 +43,4 @@ scalar_opt: lion
 adjust_lr: spectral_norm
 lr: 0.02
 
-reset_factor: 0.0
+reset_factor: 1.0

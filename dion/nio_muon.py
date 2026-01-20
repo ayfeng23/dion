@@ -156,6 +156,7 @@ class NioMuon(Optimizer):
         state = self.state[param]
         if not state:
             state["momentum"] = torch.zeros_like(param)
+            state["gradient_prev"] = torch.zeros_like(param)
             if algo == "adamw":
                 state["variance"] = torch.zeros_like(param)
         return state
@@ -211,6 +212,7 @@ class NioMuon(Optimizer):
                 gradients = [p.grad for p in params]
                 states = [self._get_or_initialize_state(p, algo_name) for p in params]
                 momentums = [s["momentum"] for s in states]
+                gradients_prev = [s["gradient_prev"] for s in states]
 
                 # Get sharding state for DTensor
                 is_batch_sharded = False
@@ -270,11 +272,12 @@ class NioMuon(Optimizer):
                 # As long as matrix dimensions are not sharded, each device will have whole matrices
                 # Each device already has different matrices of the batch, so we can't parallelize further
                 if is_batch_sharded and not is_matrix_sharded:
-                    for x, g, m, n in zip(params, gradients, momentums, names):
+                    for x, g, g_prev, m, n in zip(params, gradients, gradients_prev, momentums, names):
                         yield AsyncTask(
-                            niomuon_update_batch_async(
+                            muon_update_batch_async(
                                 X=[x],
                                 G=[g],
+                                G_prev=[g_prev],
                                 M=[m],
                                 names=[n],
                                 shard_dim=None,  # No sharded matrix dim
@@ -284,9 +287,10 @@ class NioMuon(Optimizer):
                 # Otherwise, we parallelize the Muon update across devices
                 else:
                     yield AsyncTask(
-                        niomuon_update_batch_async(
+                        muon_update_batch_async(
                             X=pad_batch(params, self._world_size),
                             G=pad_batch(gradients, self._world_size),
+                            G_prev=pad_batch(gradients_prev, self._world_size),
                             M=pad_batch(momentums, self._world_size),
                             names=pad_names(names, self._world_size),
                             shard_dim=sharded_tensor_dim,
@@ -382,6 +386,7 @@ class NioMuon(Optimizer):
 def muon_update_batch_async(
     X: List[Tensor],  # Model weights (modified in place)
     G: List[Tensor],  # Gradient
+    G_prev: List[Tensor],
     M: List[Tensor],  # Momentum buffer (modified in place)
     names: List[str],
     lr: Tensor,  # Learning rate (scalar tensor)
@@ -406,9 +411,16 @@ def muon_update_batch_async(
     """
 
     assert len(X) == len(G)
+    assert len(G) == 1
     assert len(X) == len(M)
 
     G_local = to_local(G)
+    U_local = [muon_update_newton_schulz(
+                    M[0],
+                    newton_schulz_func=newton_schulz_func,
+                    flatten=flatten,
+                    epsilon=epsilon,
+                )]
     M_local = to_local(M)
     
     #Non distributed implementation. Must implement a new gm_dot for distributed as G_local contains
@@ -426,9 +438,34 @@ def muon_update_batch_async(
             f"loss_increase/{name}": loss_increase,
             f"loss_increase/{name}_reset": reset,
         }, commit=False)
+    m_g_product = inner_product(M_local[0], G_local[0]).item()
+    m_g_cosine = normalized_inner_product(M_local[0], G_local[0]).item()
+    g_g_cosine = normalized_inner_product(G_local[0], G_prev[0]).item()
+    o_g_product = inner_product(U_local[0], G_local[0]).item()
+    o_g_cosine = normalized_inner_product(U_local[0], G_local[0]).item()
 
-    if loss_increase > 0:
-        torch._foreach_mul_(M, reset_factor)
+    # loss_increase = gm_dot.item()
+    # name = names[0] if names else "<unnamed>"
+    # reset = float(loss_increase < 0)
+
+    if process_group is None or device_rank == 0:
+        wandb.log({
+            f"m_g_product/{name}": m_g_product,
+            f"m_g_cosine/{name}": m_g_cosine,
+            f"g_g_cosine/{name}": g_g_cosine,
+            f"o_g_product/{name}": o_g_product,
+            f"o_g_cosine/{name}": o_g_cosine,
+        }, commit=False)
+        # if "/0." in name:
+        #     s = randomized_svdvals_topk(M_local[0], k=20, oversample=8, n_iter=2)  # W on GPU
+        #     wandb.log({f"sv/{name}_momentum": s.detach().float().cpu().numpy()}, commit=False)
+        #     s = randomized_svdvals_topk(G_local[0], k=20, oversample=8, n_iter=2)  # W on GPU
+        #     wandb.log({f"sv/{name}_gradient": s.detach().float().cpu().numpy()}, commit=False)
+
+    for (g_prev, g) in zip(G_prev, G):
+        g_prev.copy_(g)
+    # if loss_increase > 0:
+    #     torch._foreach_mul_(M, 0)
 
     # Update momentum and compute the inputs for orthogonalization
     U = muon_update_pre_orthogonalize(
@@ -548,6 +585,7 @@ def muon_update_batch_async(
 def niomuon_update_batch_async(
     X: List[Tensor],  # Model weights (modified in place)
     G: List[Tensor],  # Gradient
+    G_prev: List[Tensor],
     M: List[Tensor],  # Momentum buffer (modified in place)
     names: List[str],
     lr: Tensor,  # Learning rate (scalar tensor)
@@ -626,22 +664,36 @@ def niomuon_update_batch_async(
     
     #Non distributed implementation. Must implement a new gm_dot for distributed as G_local contains
     #parameters from multiple groups, so you shouldn't do += but reduce from all devices. 
-    gm_dot = torch.zeros((), device=G_local[0].device)
-    for g, u in zip(G_local, U_local):
-        gm_dot += torch.sum(g * u)
+    # gm_dot = torch.zeros((), device=G_local[0].device)
+    # for g, u in zip(G_local, U_local):
+    #     gm_dot += torch.sum(g * u)
     # print0(len(G_local))
 
-    loss_increase = gm_dot.item()
+    m_g_product = inner_product(M_local[0], G_local[0]).item()
+    m_g_cosine = normalized_inner_product(M_local[0], G_local[0]).item()
+    g_g_cosine = normalized_inner_product(G_local[0], G_prev[0]).item()
+    o_g_product = inner_product(U_local[0], G_local[0]).item()
+    o_g_cosine = normalized_inner_product(U_local[0], G_local[0]).item()
+
+    # loss_increase = gm_dot.item()
     name = names[0] if names else "<unnamed>"
-    reset = float(loss_increase < 0)
+    # reset = float(loss_increase < 0)
     if process_group is None or device_rank == 0:
         wandb.log({
-            f"loss_increase/{name}": loss_increase,
-            f"loss_increase/{name}_reset": reset,
+            f"m_g_product/{name}": m_g_product,
+            f"m_g_cosine/{name}": m_g_cosine,
+            f"g_g_cosine/{name}": g_g_cosine,
+            f"o_g_product/{name}": o_g_product,
+            f"o_g_cosine/{name}": o_g_cosine,
+            # f"loss_increase/{name}": loss_increase,
+            # f"loss_increase/{name}_reset": reset,
         }, commit=False)
 
-    if loss_increase < 0:
-        torch._foreach_mul_(M, reset_factor)
+    # if loss_increase < 0:
+    #     torch._foreach_mul_(M, reset_factor)
+
+    for (g_prev, g) in zip(G_prev, G):
+        g_prev.copy_(g)
 
     # Update momentum and compute the inputs for orthogonalization
     assert nesterov == False
@@ -794,3 +846,32 @@ def zeropower_via_newtonschulz5(G: Tensor, epsilon: float = 1e-7):
     if G.size(-2) > G.size(-1):
         X = X.mT
     return X
+
+def inner_product(A: Tensor, B: Tensor):
+    return torch.sum(A * B)
+
+def normalized_inner_product(A: Tensor, B: Tensor):
+    return torch.sum(A * B) / (torch.sqrt(torch.sum(A * A)) * torch.sqrt(torch.sum(B * B)))
+
+@torch.no_grad()
+def randomized_svdvals_topk(
+    X: torch.Tensor,
+    k: int = 20,
+    oversample: int = 8,
+    n_iter: int = 2,
+    reorthonormalize: bool = True,
+    compute_dtype: torch.dtype = torch.float32,
+):
+    m, n = X.shape
+    r = k + oversample
+    Xc = X.to(dtype=compute_dtype)
+    Omega = torch.randn(n, r, device=X.device, dtype=compute_dtype)
+    Y = Xc @ Omega
+    for _ in range(n_iter):
+        if reorthonormalize:
+            Y, _ = torch.linalg.qr(Y, mode="reduced")
+        Y = Xc @ (Xc.T @ Y)  # (m, r)
+    Q, _ = torch.linalg.qr(Y, mode="reduced")  # (m, r)
+    B = Q.T @ Xc  # (r, n)
+    s = torch.linalg.svdvals(B)  # length r, descending
+    return s[:k].to(dtype=X.dtype)

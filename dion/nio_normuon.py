@@ -31,6 +31,8 @@ from .muon import (
     adjust_lr_rms_norm,
 )
 
+from .nio_muon import inner_product, normalized_inner_product
+
 
 class NioNorMuon(Optimizer):
     """
@@ -199,6 +201,7 @@ class NioNorMuon(Optimizer):
         state = self.state[param]
         if not state:
             state["momentum"] = torch.zeros_like(param)
+            state["gradient_prev"] = torch.zeros_like(param)
             if algo == "adamw":
                 state["variance"] = torch.zeros_like(param)
             if algo == "nionormuon":
@@ -258,6 +261,7 @@ class NioNorMuon(Optimizer):
                 states = [self._get_or_initialize_state(p, algo_name) for p in params]
                 momentums = [s["momentum"] for s in states]
                 variances_neuron = [s["variance_neuron"] for s in states]
+                gradients_prev = [s["gradient_prev"] for s in states]
 
                 # Get sharding state for DTensor
                 is_batch_sharded = False
@@ -325,11 +329,12 @@ class NioNorMuon(Optimizer):
                 # As long as matrix dimensions are not sharded, each device will have whole matrices
                 # Each device already has different matrices of the batch, so we can't parallelize further
                 if is_batch_sharded and not is_matrix_sharded:
-                    for x, g, m, n in zip(params, gradients, momentums, names):
+                    for x, g, g_prev, m, n in zip(params, gradients, gradients_prev, momentums, names):
                         yield AsyncTask(
                             normuon_update_batch_async(
                                 X=[x],
                                 G=[g],
+                                G_prev=[g_prev],
                                 M=[m],
                                 V=[v],
                                 names=[n],
@@ -344,6 +349,7 @@ class NioNorMuon(Optimizer):
                             X=pad_batch(params, self._world_size),
                             G=pad_batch(gradients, self._world_size),
                             M=pad_batch(momentums, self._world_size),
+                            G_prev=pad_batch(gradients_prev, self._world_size),
                             V=pad_batch(variances_neuron, self._world_size),
                             names=pad_names(names, self._world_size),
                             shard_dim=sharded_tensor_dim,
@@ -439,6 +445,7 @@ class NioNorMuon(Optimizer):
 def normuon_update_batch_async(
     X: List[Tensor],  # Model weights (modified in place)
     G: List[Tensor],  # Gradient
+    G_prev: List[Tensor],
     M: List[Tensor],  # Momentum buffer (modified in place)
     V: List[Tensor],  # Variance neuron buffer (modified in place)
     names: List[str],
@@ -477,17 +484,41 @@ def normuon_update_batch_async(
         gm_dot += torch.sum(g * m)
     # print0(len(G_local))
 
+    U_local = normuon_normalization_prev([muon_update_newton_schulz(
+                M[0],
+                newton_schulz_func=newton_schulz_func,
+                flatten=flatten,
+                epsilon=epsilon,
+            )], V, muon_beta2)
+
+    m_g_product = inner_product(M_local[0], G_local[0]).item()
+    m_g_cosine = normalized_inner_product(M_local[0], G_local[0]).item()
+    g_g_cosine = normalized_inner_product(G_local[0], G_prev[0]).item()
+    o_g_product = inner_product(U_local[0], G_local[0]).item()
+    o_g_cosine = normalized_inner_product(U_local[0], G_local[0]).item()
+
     loss_increase = gm_dot.item()
     name = names[0] if names else "<unnamed>"
     reset = float(loss_increase > 0)
     if process_group is None or device_rank == 0:
         wandb.log({
-            f"loss_increase/{name}": loss_increase,
+            # f"loss_increase/{name}": loss_increase,
             f"loss_increase/{name}_reset": reset,
         }, commit=False)
 
+    if process_group is None or device_rank == 0:
+        wandb.log({
+            f"m_g_product/{name}": m_g_product,
+            f"m_g_cosine/{name}": m_g_cosine,
+            f"g_g_cosine/{name}": g_g_cosine,
+            f"o_g_product/{name}": o_g_product,
+            f"o_g_cosine/{name}": o_g_cosine,
+        }, commit=False)
+
+    for (g_prev, g) in zip(G_prev, G):
+        g_prev.copy_(g)
     if loss_increase > 0:
-        torch._foreach_mul_(M, reset_factor)
+        torch._foreach_mul_(M, 0.0)
 
     # Update momentum and compute the inputs for orthogonalization
     U = muon_update_pre_orthogonalize(
@@ -636,6 +667,36 @@ def normuon_normalization(
     )  # Update variance neuron buffer
 
     denom = torch._foreach_sqrt(V)  # list of sqrt(v)
+    torch._foreach_add_(denom, 1e-8)  # denom[i] += 1e-8
+    normalized_U = torch._foreach_div(U, denom)  # list of u / denom
+
+    norm_U_new = [
+        nu.norm(p=2, dim=(-2, -1), keepdim=True) for nu in normalized_U
+    ]  # list of ||normalized_u||_F, shape [*, 1, 1]
+    ratio = torch._foreach_div(
+        norm_U, norm_U_new
+    )  # list of ||u||_F / ||normalized_u||_F, shape [*, 1, 1]
+    torch._foreach_mul_(normalized_U, ratio)  # normalized_u[i] *= ratio
+
+    return normalized_U
+
+
+
+def normuon_normalization_prev(
+    U: List[Tensor],
+    V: List[Tensor],
+    muon_beta2: Tensor,
+) -> List[Tensor]:
+    V_dtype = V[0].dtype
+    U = [u.to(dtype=V_dtype) for u in U]
+    norm_U = [
+        u.norm(p=2, dim=(-2, -1), keepdim=True) for u in U
+    ]
+
+    U_sq = torch._foreach_mul(U, U)  # list of u*u, same shapes as U
+    neuron_norms = [u_sq.mean(dim=-1, keepdim=True) for u_sq in U_sq]  # Shape: [*, 1]
+
+    denom = torch._foreach_sqrt(torch._foreach_lerp(V, neuron_norms, 1 - muon_beta2))
     torch._foreach_add_(denom, 1e-8)  # denom[i] += 1e-8
     normalized_U = torch._foreach_div(U, denom)  # list of u / denom
 

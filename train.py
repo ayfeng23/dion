@@ -1015,15 +1015,20 @@ def main():
     )
 
     # Learning rate scheduler
+    # def get_lr(it):
+    #     warmup_iters = round(hp.warmup_ratio * hp.num_iterations)
+    #     warmdown_iters = round(hp.warmdown_ratio * hp.num_iterations)
+    #     if it < warmup_iters:
+    #         return (it + 1) / warmup_iters
+    #     elif it <= hp.num_iterations - warmdown_iters:
+    #         return 1.0
+    #     else:
+    #         return (hp.num_iterations - it) / warmdown_iters
     def get_lr(it):
-        warmup_iters = round(hp.warmup_ratio * hp.num_iterations)
-        warmdown_iters = round(hp.warmdown_ratio * hp.num_iterations)
-        if it < warmup_iters:
-            return (it + 1) / warmup_iters
-        elif it <= hp.num_iterations - warmdown_iters:
-            return 1.0
-        else:
-            return (hp.num_iterations - it) / warmdown_iters
+        decay_ratio = it / hp.num_iterations
+        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
+        return coeff
+
 
     lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr)
 
@@ -1098,6 +1103,7 @@ def main():
                 id=wandb_id,
                 resume=resume,
             )
+            wandb.define_metric("sv/*", summary=None)
             # If we got a new ID, update the checkpoint manager
             checkpoint_manager.wandb_id = wandb.run.id
 

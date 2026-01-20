@@ -7,7 +7,7 @@
 #SBATCH --cpus-per-gpu=8
 #SBATCH --gpus=h200:1
 #SBATCH --mem=64G
-#SBATCH --array=0-3
+#SBATCH --array=0
 
 export PATH="$HOME/.local/bin:$PATH"
 
@@ -16,8 +16,8 @@ module load Python/3.10.8-GCCcore-12.2.0
 source .venv/bin/activate
 
 # -------- Grid --------
-LRS=(0.04 0.02)
-RESET_FACTORS=(0 0.5)
+LRS=(0.02 0.02)
+RESET_FACTORS=(1.0 0.5)
 
 # Map SLURM_ARRAY_TASK_ID -> (lr_idx, rf_idx)
 NUM_RF=${#RESET_FACTORS[@]}

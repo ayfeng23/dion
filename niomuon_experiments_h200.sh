@@ -2,12 +2,12 @@
 #SBATCH --job-name=niomuon_grid
 #SBATCH --output=logs/h200_niomuon_grid_%a.out
 #SBATCH --error=logs/h200_niomuon_grid_%a.err
-#SBATCH --time=3:00:00
+#SBATCH --time=2:00:00
 #SBATCH --partition=gpu_h200
 #SBATCH --cpus-per-gpu=8
 #SBATCH --gpus=h200:1
 #SBATCH --mem=64G
-#SBATCH --array=0-1
+#SBATCH --array=0
 
 export PATH="$HOME/.local/bin:$PATH"
 
@@ -17,7 +17,7 @@ source .venv/bin/activate
 
 # -------- Grid --------
 LRS=(0.02)
-RESET_FACTORS=(0.0 0.5)
+RESET_FACTORS=(1.0 0.5)
 
 # Map SLURM_ARRAY_TASK_ID -> (lr_idx, rf_idx)
 NUM_RF=${#RESET_FACTORS[@]}

@@ -41,6 +41,6 @@ no_triton: false
 optimizer: nionormuon 
 scalar_opt: lion
 adjust_lr: spectral_norm
-lr: 0.02
+lr: 0.03
 
-reset_factor: 0.0
+reset_factor: 1.0
