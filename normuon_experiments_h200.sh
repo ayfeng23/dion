@@ -3,7 +3,7 @@
 #SBATCH --output=logs/h200_fraction_%a.out 
 #SBATCH --error=logs/h200_fraction_%a.err
 #SBATCH --time=2:00:00
-#SBATCH --partition=gpu_h200
+#SBATCH --partition=scavenge_gpu
 #SBATCH --cpus-per-gpu=8
 #SBATCH --gpus=h200:1
 #SBATCH --mem=64G
@@ -20,7 +20,7 @@ CONFIG="configs/fracnormuon_160m.yaml"
 CONFIG_TMP=$(mktemp)
 
 WARMUP=0.05
-ORTHO_FRACTION=1.0
+ORTHO_FRACTION=0.75
 PARTIAL_WARMUP=true
 
 sed -E \

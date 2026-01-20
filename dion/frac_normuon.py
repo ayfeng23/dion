@@ -8,14 +8,17 @@ from torch.distributed.tensor import DeviceMesh, DTensor
 from torch.optim.optimizer import Optimizer, ParamsT
 from typing import Callable, Generator, List, Optional, Tuple, Union
 from .muon import muon_update_pre_orthogonalize
-# from .normuon_front import normuon_front_second_moment
+from .normuon_front import normuon_front_second_moment
+import wandb
 
 from .newton_schulz_triton import newton_schulz_triton, zeropower_via_newtonschulz5
 from .opt_utils import (
     AsyncRuntime,
     AsyncTask,
     create_param_batches,
+    create_named_batches,
     pad_batch,
+    pad_names,
     to_local,
 )
 from .scalar_opts import adamw_update_foreach_async, lion_update_foreach_async
@@ -189,8 +192,17 @@ class FracNormuon(Optimizer):
                 p.ndim >= 2 for p in group["params"]
             ), "Fracnormuon only supports matrix parameters."
 
-            group_params = [p for p in group["params"] if p.grad is not None]
-            if not group_params:
+            if "param_names" in group:
+                group_items = [
+                    (p, n)
+                    for p, n in zip(group["params"], group["param_names"])
+                    if p.grad is not None
+                ]
+            else:
+                group_items = [(p, "<unnamed>") for p in group["params"] if p.grad is not None]
+
+            # group_params = [p for p in group["params"] if p.grad is not None]
+            if not group_items:
                 continue
 
             # Most hyperparameters as tensors for torch.compile
@@ -217,9 +229,9 @@ class FracNormuon(Optimizer):
             )
 
             # Create batches of parameters of size self._world_size
-            for params in create_param_batches(
-                group_params, batch_size=self._world_size
-            ):
+            for batch in create_named_batches(group_items, batch_size=self._world_size):
+                params = [p for p, _ in batch]
+                names  = [n for _, n in batch]
                 gradients = [p.grad for p in params]
                 states = [self._get_or_initialize_state(p, "fracnormuon") for p in params]
                 momentums = [s["momentum"] for s in states]
@@ -289,6 +301,7 @@ class FracNormuon(Optimizer):
                                 X=[x],
                                 G=[g],
                                 M=[m],
+                                names=[n],
                                 V=[v],
                                 shard_dim=None,  # No sharded matrix dim
                                 **fracnormuon_args,
@@ -302,6 +315,7 @@ class FracNormuon(Optimizer):
                             X=pad_batch(params, self._world_size),
                             G=pad_batch(gradients, self._world_size),
                             M=pad_batch(momentums, self._world_size),
+                            names=pad_names(names, self._world_size),
                             V=pad_batch(variances, self._world_size),
                             shard_dim=sharded_tensor_dim,
                             **fracnormuon_args,
@@ -394,6 +408,7 @@ def fracnormuon_update_batch_async(
     X: List[Tensor],  # Model weights (modified in place)
     G: List[Tensor],  # Gradient
     M: List[Tensor],  # Momentum buffer (modified in place)
+    names: List[str],
     V: List[Tensor],
     lr: Tensor,  # Learning rate (scalar tensor)
     muon_beta2: Tensor,
@@ -572,6 +587,9 @@ def fracnormuon_update_batch_async(
         full_lr=full_lr,
         adjusted_full_lr=adjusted_full_lr,
         partial_warmup=(full_lr is not None) and (step < warmup_cutoff),
+        process_group=process_group,
+        device_rank=device_rank,
+        names=names,
     )
 
 
@@ -664,7 +682,7 @@ def fracnormuon_pre_orthogonalize(
 
     return [u.clone() for u in U], U_selected, indices_list
 
-@torch.compile(fullgraph=True)
+# @torch.compile(fullgraph=True)
 def dion2_post_orthogonalize(
     X: List[Tensor],
     O: List[Tensor],
@@ -678,8 +696,12 @@ def dion2_post_orthogonalize(
     full_lr: Optional[Tensor],
     adjusted_full_lr: Optional[Tensor],
     partial_warmup: bool,
+    process_group: Optional[ProcessGroup],
+    device_rank: int,
+    names: List[str],
 ):
     dtype = X[0].dtype
+    assert len(X) == 1
     O = [o.to(dtype=dtype) for o in O]
     U = [u.to(dtype=dtype) for u in U]
     if not partial_warmup:
@@ -687,6 +709,20 @@ def dion2_post_orthogonalize(
         adjusted_full_lr = adjusted_lr
 
     for x, o, u, idx in zip(X, O, U, indices):
+        u_frob = u.norm(p="fro")
+        u_frob_per_elem = u_frob / math.sqrt(u.numel())
+        x_subset = x.index_select(select_dim, idx)
+        x_subset_frob = x_subset.norm(p="fro")
+        x_frob_per_elem = x.norm(p="fro") / math.sqrt(x.numel())
+
+        name = names[0] if names else "<unnamed>"
+        if process_group is None or device_rank == 0:
+            wandb.log({
+                f"u_frob/{name}": u_frob.item(),
+                f"x_replace_frob/{name}": x_subset_frob.item(),
+                f"u_frob_norm/{name}": u_frob_per_elem.item(),
+                f"x_frob_norm/{name}": x_frob_per_elem.item()
+            }, commit=False)
         x_sel = x.index_select(select_dim, idx)
         x.mul_(1 - base_lr * weight_decay)
         x_sel.mul_(1 - full_lr * weight_decay)
