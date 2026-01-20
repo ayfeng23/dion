@@ -7,12 +7,12 @@
 #SBATCH --cpus-per-gpu=8
 #SBATCH --gpus=h200:1
 #SBATCH --mem=64G
-#SBATCH --array=0                 # Creates 3 sub-jobs
+#SBATCH --array=0-2                 # Creates 3 sub-jobs
 export PATH="$HOME/.local/bin:$PATH"
 source .venv/bin/activate
 module load Python/3.10.8-GCCcore-12.2.0
 
-FRACTIONS=(0.5)
+FRACTIONS=(0.5 0.25 0.75)
 export WANDB_API_KEY=6847fa93f84b5335cd0ba5f438e6ba60fbe5b76b
 
 MY_FRACTION=${FRACTIONS[$SLURM_ARRAY_TASK_ID]}

@@ -50,7 +50,9 @@ class FracNormuon(Optimizer):
         use_triton: bool = False,
         newton_schulz_func: Optional[Callable] = None,
         verbose: bool = False,
+        # Austin: partial_warmup determines whether to use warmup on all updates (False) or orthonormalized ones (True)
         partial_warmup: bool = True, 
+        # Austin: warmup_cutoff is an auxiliary variable to ensure partial_warmup logic only affects warmup (and not warmdown crucially)
         warmup_cutoff: int = 0, 
     ):
         # Validate hyperparameters
@@ -81,8 +83,10 @@ class FracNormuon(Optimizer):
             ef_partial=ef_partial,
             adjust_lr=adjust_lr,
             algorithm="fracnormuon",
+            # Austin: step needed to see if we reach warmup_cutoff
             step=0,
             warmup_cutoff=warmup_cutoff,
+            # Austin: store warmup-non-adjusted learning rate
             full_lr=torch.tensor(lr) if partial_warmup else None,
         )
         super().__init__(params, defaults)
@@ -408,7 +412,7 @@ def fracnormuon_update_batch_async(
     X: List[Tensor],  # Model weights (modified in place)
     G: List[Tensor],  # Gradient
     M: List[Tensor],  # Momentum buffer (modified in place)
-    names: List[str],
+    names: List[str], # Name of Tensor parameters
     V: List[Tensor],
     lr: Tensor,  # Learning rate (scalar tensor)
     muon_beta2: Tensor,
@@ -451,15 +455,16 @@ def fracnormuon_update_batch_async(
             select_dim = -2  # Row-sharded
         elif shard_dim == -1:
             select_dim = -1  # Column-sharded
+            # Austin: if shard_dim=-1, this affects neuron_variances
+            raise NotImplementedError(
+                "NorMuon currently does not support parameters sharded along the last dimension. "
+                "Please avoid shards at dim -1."
+            )
 
     # Fall-back to shorter dimension when DDP, Single-GPU, or batch-sharded
     if select_dim is None:
         num_rows, num_cols = X[0].shape[-2:]
         select_dim = -2 if num_rows <= num_cols else -1
-
-    #temporary until distributed support for col sharded
-    select_dim=-2
-    assert select_dim == -2
 
     # Print how the selection choice based on shard_dim and tensor shape
     if verbose:
@@ -475,7 +480,7 @@ def fracnormuon_update_batch_async(
         muon_beta2=muon_beta2,
     )
 
-    # Apply error feedback decay to selected slices in original M tensors
+    # Austin: error feedback only updated params
     if interp == 0:
         for m, idx in zip(M, indices_list):
             selected_slice = m.index_select(dim=select_dim, index=idx)
@@ -574,6 +579,7 @@ def fracnormuon_update_batch_async(
     else:
         raise ValueError(f"Unknown adjust_lr: {adjust_lr}")
 
+    # print("LR", full_lr, lr) # Austin: checking if full_lr actually is the right lr and it is
     dion2_post_orthogonalize(
         X=to_local(X),
         O=O,
@@ -586,38 +592,13 @@ def fracnormuon_update_batch_async(
         interp=interp,
         full_lr=full_lr,
         adjusted_full_lr=adjusted_full_lr,
+        # Austin: full_lr is not None occurs only when we use partial_warmup for the run, step < warmup_cutoff so that orthonormalized parts can warm down
         partial_warmup=(full_lr is not None) and (step < warmup_cutoff),
         process_group=process_group,
         device_rank=device_rank,
         names=names,
     )
 
-
-
-@torch.compile(fullgraph=True)
-def normuon_front_normalization(
-    M_new: List[Tensor],
-    V: List[Tensor],
-    muon_beta2: Tensor,
-) -> List[Tensor]:
-    """
-    NorMuon normalization step after orthogonalization.
-    Inputs and outputs should be lists of regular Tensor, not DTensor.
-    This is a separate function for compatibility with torch.compile().
-    """
-    V_dtype = V[0].dtype
-    M_new = [m_new.to(dtype=V_dtype) for m_new in M_new]
-
-    M_new_sq = torch._foreach_mul(M_new, M_new)  # list of m*m, same shapes as M_new
-    neuron_norms = [m_new_sq.mean(dim=-1, keepdim=True) for m_new_sq in M_new_sq]  # Shape: [*, 1]
-    torch._foreach_lerp_(
-        V, neuron_norms, 1 - muon_beta2
-    )  # Update variance neuron buffer
-
-    denom = torch._foreach_sqrt(V)  # list of sqrt(v)
-    torch._foreach_add_(denom, 1e-8)  # denom[i] += 1e-8
-    normalized_U = torch._foreach_div(M_new, denom)  # list of u / denom
-    return normalized_U
 
 @torch.compile(fullgraph=True)
 def fracnormuon_pre_orthogonalize(
@@ -652,7 +633,6 @@ def fracnormuon_pre_orthogonalize(
     torch._foreach_add_(M, G)
 
     #Non-distributed / no-communication for row-sharding
-    # U = normuon_front_normalization(M, V, muon_beta2)
     U = normuon_front_second_moment(G, M, V, muon_beta2)
 
     U_stacked = torch.stack(U, dim=0)
@@ -701,28 +681,33 @@ def dion2_post_orthogonalize(
     names: List[str],
 ):
     dtype = X[0].dtype
-    assert len(X) == 1
+    # assert len(X) == 1
     O = [o.to(dtype=dtype) for o in O]
     U = [u.to(dtype=dtype) for u in U]
-    if not partial_warmup:
+    if not partial_warmup: #default to full updates (mostly for warmdown)
         full_lr = base_lr
         adjusted_full_lr = adjusted_lr
 
-    for x, o, u, idx in zip(X, O, U, indices):
-        u_frob = u.norm(p="fro")
-        u_frob_per_elem = u_frob / math.sqrt(u.numel())
-        x_subset = x.index_select(select_dim, idx)
-        x_subset_frob = x_subset.norm(p="fro")
-        x_frob_per_elem = x.norm(p="fro") / math.sqrt(x.numel())
+    for x, o, u, name, idx in zip(X, O, U, names, indices):
+        # Austin: O is NS(U) and U=Adam-Normalized(M)
+        # u_subset is the "replaced" part of U
+        o_frob = o.norm(p="fro")
+        o_frob_per_elem = o_frob / math.sqrt(o.numel())
+        u_subset = u.index_select(select_dim, idx)
+        u_subset_frob = u_subset.norm(p="fro")
+        u_frob_per_elem = u.norm(p="fro") / math.sqrt(x.numel())
 
-        name = names[0] if names else "<unnamed>"
-        if process_group is None or device_rank == 0:
-            wandb.log({
-                f"u_frob/{name}": u_frob.item(),
-                f"x_replace_frob/{name}": x_subset_frob.item(),
-                f"u_frob_norm/{name}": u_frob_per_elem.item(),
-                f"x_frob_norm/{name}": x_frob_per_elem.item()
-            }, commit=False)
+        # if process_group is None or device_rank == 0: 
+            # Austin: under DDP, I assume this gets the "whole batch", because you accum gradient anyway?
+            # And you don't need to shard params?
+        wandb.log({
+            f"o_frob/{name}": o_frob.item(),
+            f"u_replace_frob/{name}": u_subset_frob.item(),
+            f"o_frob_norm/{name}": o_frob_per_elem.item(),
+            f"u_frob_norm/{name}": u_frob_per_elem.item()
+        }, commit=False)
+        # Austin: first do weight decay and then updates
+        # split weight_decay based on learning rates
         x_sel = x.index_select(select_dim, idx)
         x.mul_(1 - base_lr * weight_decay)
         x_sel.mul_(1 - full_lr * weight_decay)
@@ -732,43 +717,6 @@ def dion2_post_orthogonalize(
         x.sub_((u * interp) * adjusted_lr)
         x_sel.sub_(o * adjusted_full_lr)  
         x.index_copy_(select_dim, idx, x_sel)
-
-# @torch.compile(fullgraph=True)
-# def dion2_post_orthogonalize(
-#     X: List[Tensor],
-#     O: List[Tensor],
-#     U: List[Tensor],
-#     indices: List[Tensor],
-#     base_lr: Tensor,
-#     adjusted_lr: Tensor,
-#     weight_decay: Tensor,
-#     select_dim: int,
-#     interp: float,
-#     full_lr: Optional[Tensor],
-#     adjusted_full_lr: Optional[Tensor]
-# ):
-#     """
-#     Apply weight decay and weight update after orthogonalization.
-#     Inputs and outputs should be lists of regular Tensor, not DTensor.
-#     This is a separate function for compatibility with torch.compile().
-#     """
-#     torch._foreach_mul_(X, 1 - base_lr * weight_decay)
-
-#     # Convert U to match parameter dtype
-#     dtype = X[0].dtype
-#     O = [o.to(dtype=dtype) for o in O]
-#     U = [u.to(dtype=dtype) for u in U]
-#     # Apply weight update
-#     # neg_lr = -adjusted_lr
-
-#     O_full = [u.to(dtype=o.dtype) for u, o in zip(U, O)] 
-#     torch._foreach_mul_(O_full, interp)
-    
-#     for of, o, idx in zip(O_full, O, indices):
-#         of.index_copy_(select_dim, idx, o)
-
-#     torch._foreach_mul_(O_full, adjusted_lr)
-#     torch._foreach_sub_(X, O_full)
 
 
 # A helper function to print selection chocie for each matrix
@@ -812,30 +760,3 @@ def _print_selection_choice(
             f"[FracNormuon] Shape {tuple(shape)}: {mode}, {reason} → "
             f"select top-α {select_info} by {norm_info}"
         )
-
-
-
-@torch.compile(fullgraph=True)
-def normuon_front_normalization(
-    M_new: List[Tensor],
-    V: List[Tensor],
-    muon_beta2: Tensor,
-) -> List[Tensor]:
-    """
-    NorMuon normalization step after orthogonalization.
-    Inputs and outputs should be lists of regular Tensor, not DTensor.
-    This is a separate function for compatibility with torch.compile().
-    """
-    V_dtype = V[0].dtype
-    M_new = [m_new.to(dtype=V_dtype) for m_new in M_new]
-
-    M_new_sq = torch._foreach_mul(M_new, M_new)  # list of m*m, same shapes as M_new
-    neuron_norms = [m_new_sq.mean(dim=-1, keepdim=True) for m_new_sq in M_new_sq]  # Shape: [*, 1]
-    torch._foreach_lerp_(
-        V, neuron_norms, 1 - muon_beta2
-    )  # Update variance neuron buffer
-
-    denom = torch._foreach_sqrt(V)  # list of sqrt(v)
-    torch._foreach_add_(denom, 1e-8)  # denom[i] += 1e-8
-    normalized_U = torch._foreach_div(M_new, denom)  # list of u / denom
-    return normalized_U

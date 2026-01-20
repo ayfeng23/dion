@@ -44,22 +44,6 @@ def dtensor_from_local(
         for t in tensor
     ]
 
-def create_named_batches(
-    items: List[Tuple[Tensor, str]], batch_size: int
-) -> Generator[List[Tuple[Tensor, str]], None, None]:
-    """
-    Batch (param, name) pairs into groups of size `batch_size`.
-    Batching key is taken from the param: (shape, sharding, dtype).
-    """
-    groups = defaultdict(list)
-    for p, name in items:
-        sharding = p.placements if isinstance(p, DTensor) else None
-        groups[(p.shape, sharding, p.dtype)].append((p, name))
-
-    for group in groups.values():
-        for i in range(0, len(group), batch_size):
-            yield group[i : i + batch_size]
-
 def create_param_batches(
     params: List[Tensor], batch_size: int
 ) -> Generator[List[Tensor], None, None]:
@@ -79,7 +63,6 @@ def create_param_batches(
             batch = group[i : i + batch_size]
             yield batch
 
-
 def pad_batch(batch: List[Tensor], batch_size: int) -> List[Tensor]:
     """
     Insert dummy tensors so the batch has exactly `batch_size` elements.
@@ -89,6 +72,23 @@ def pad_batch(batch: List[Tensor], batch_size: int) -> List[Tensor]:
     while len(batch) < batch_size:
         batch.append(torch.empty_like(batch[0]))
     return batch
+
+# Austin: The below functions are modifications to support mapping names with corresponding params
+def create_named_batches(
+    items: List[Tuple[Tensor, str]], batch_size: int
+) -> Generator[List[Tuple[Tensor, str]], None, None]:
+    """
+    Batch (param, name) pairs into groups of size `batch_size`.
+    Batching key is taken from the param: (shape, sharding, dtype).
+    """
+    groups = defaultdict(list)
+    for p, name in items:
+        sharding = p.placements if isinstance(p, DTensor) else None
+        groups[(p.shape, sharding, p.dtype)].append((p, name))
+
+    for group in groups.values():
+        for i in range(0, len(group), batch_size):
+            yield group[i : i + batch_size]
 
 def pad_names(names: List[str], batch_size: int) -> List[str]:
     """

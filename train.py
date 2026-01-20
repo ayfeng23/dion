@@ -323,7 +323,8 @@ def init_optimizer(
 
     seen = set()
 
-    # Separate the model's parameters based on their types
+    # Austin: Use named parameters for all parameters
+    # embedding and lm_head names are not used but included just in case
     matrix_named = list(model.transformer.h.named_parameters())
     embedding_named = list(model.transformer.wte.named_parameters())
     lm_head_named = list(model.lm_head.named_parameters())
@@ -359,6 +360,7 @@ def init_optimizer(
         )
     )
 
+    # Austin: extra check to double check no overlapping names
     for gi, g in enumerate(param_groups):
         for p in g["params"]:
             assert p not in seen, f"Param in multiple groups: {name_of.get(p, '<unnamed>')}"
@@ -591,7 +593,7 @@ def init_optimizer(
             partial_warmup=hp.partial_warmup,
             adjust_lr=hp.adjust_lr,
             use_triton=(not cli_args.no_triton),
-            warmup_cutoff=round(hp.warmup_ratio * hp.num_iterations), #check off by one later
+            warmup_cutoff=round(hp.warmup_ratio * hp.num_iterations),
             # verbose=True,
         )
 
@@ -971,30 +973,52 @@ def main():
     # --- WandB initialization ---
     if not cli_args.no_wandb and not cli_args.debug:
         assert hp.wandb_project_name, "wandb project name is required"
+
+        # Austin: for creating / resuming run before broadcasting
+        # accesible local variable
+        wandb_id = checkpoint_manager.wandb_id
+
         if MASTER_PROCESS:
-            # Check if we already have a wandb ID from the checkpoint
-            wandb_id = checkpoint_manager.wandb_id
             resume = "must" if wandb_id else "never"
             wandb.login(
                 key=os.environ.get("WANDB_API_KEY"),
                 host=os.environ.get("WANDB_HOST"),
                 timeout=0,
             )
-            wandb.init(
+            run = wandb.init(
                 project=hp.wandb_project_name,
                 name=run_name,
                 config=hp.__dict__,
                 id=wandb_id,
                 resume=resume,
+                settings=wandb.Settings(
+                    mode="shared",
+                    x_primary=True, # Austin: declares rank 0 as primary
+                    x_label=f"rank_{dist.get_rank()}",
+                ),
             )
-            # If we got a new ID, update the checkpoint manager
-            checkpoint_manager.wandb_id = wandb.run.id
+            checkpoint_manager.wandb_id = run.id
 
         # Broadcast wandb_id to all processes
         # Do this to ensure consistency of distributed checkpoint
         obj_list = [checkpoint_manager.wandb_id]
         dist.broadcast_object_list(obj_list, src=0)
         checkpoint_manager.wandb_id = obj_list[0]
+
+        # Austin: attach other processes to wandb run from master process
+        if not MASTER_PROCESS:
+            wandb.init(
+                project=hp.wandb_project_name,
+                id=checkpoint_manager.wandb_id,
+                resume="allow",
+                settings=wandb.Settings(
+                    mode="shared",
+                    x_primary=False,
+                    x_label=f"rank_{dist.get_rank()}",
+                    x_update_finish_state=False,
+                ),
+            )
+
 
     # --- Training Loop ---
     x, y = train_loader.next_batch()
