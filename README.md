@@ -1,3 +1,21 @@
+# Custom for Kwangjun
+export WANDB_ENTITY="kwangjunahn"
+
+```bash
+export WANDB_API_KEY="a9dddea045e5426079a23680e449624f771620ec"
+export WANDB_HOST="https://microsoft-research.wandb.io"
+
+
+NODES=1 \
+CONTAINER_IMAGE_PATH="nvcr.io/nvidia/pytorch:25.02-py3" \
+TRANSFER_VARS="WANDB_API_KEY WANDB_HOST"  \
+JOB_NAME="p0-neuron-normalize" \
+ENV_SETUP_SCRIPT="setup_env.sh" \
+bash /usr/local/bin/vsubmit.sh train.py --config configs/ahn/dion2_350m.yaml
+
+```
+
+
 # Welcome to the Microsoft/Dion Codebase
 
 This repository provides efficient implementations of orthonormal optimizers for distributed ML training.
