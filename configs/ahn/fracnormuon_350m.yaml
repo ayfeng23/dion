@@ -36,7 +36,7 @@ debug: false
 no_compile: false
 no_triton: false
 
-optimizer: dion2
+optimizer: fracnormuon
 ortho_fraction: 0.5
 scalar_opt: adamw
 adjust_lr: spectral_norm
@@ -44,3 +44,5 @@ lr: 0.02
 
 interp: 0.1
 ef_partial: false
+
+data_dir: /data/datasets/fineweb100B 

@@ -446,25 +446,9 @@ def fracnormuon_update_batch_async(
     # For sharded matrices, we align select_dim with shard_dim
     # For unsharded matrices (DDP or single-GPU), we select the shorter dimension
     ndim = X[0].ndim
-    select_dim = None
 
-    if shard_dim is not None:
-        # Normalize shard_dim to negative indexing for unified treatment
-        shard_dim = shard_dim if shard_dim < 0 else shard_dim - ndim
-        if shard_dim == -2:
-            select_dim = -2  # Row-sharded
-        elif shard_dim == -1:
-            select_dim = -1  # Column-sharded
-            # Austin: if shard_dim=-1, this affects neuron_variances
-            raise NotImplementedError(
-                "NorMuon currently does not support parameters sharded along the last dimension. "
-                "Please avoid shards at dim -1."
-            )
-
-    # Fall-back to shorter dimension when DDP, Single-GPU, or batch-sharded
-    if select_dim is None:
-        num_rows, num_cols = X[0].shape[-2:]
-        select_dim = -2 if num_rows <= num_cols else -1
+    # Following NorMuon, we always choose -2 as the select_dim
+    select_dim = -2
 
     # Print how the selection choice based on shard_dim and tensor shape
     if verbose:
@@ -694,17 +678,19 @@ def dion2_post_orthogonalize(
         o_frob = o.norm(p="fro")
         o_frob_per_elem = o_frob / math.sqrt(o.numel())
         u_subset = u.index_select(select_dim, idx)
-        u_subset_frob = u_subset.norm(p="fro")
-        u_frob_per_elem = u.norm(p="fro") / math.sqrt(x.numel())
+        u_frob = u_subset.norm(p="fro")
+        u_frob_per_elem = u_frob / math.sqrt(o.numel())
 
         # if process_group is None or device_rank == 0: 
             # Austin: under DDP, I assume this gets the "whole batch", because you accum gradient anyway?
             # And you don't need to shard params?
         wandb.log({
             f"o_frob/{name}": o_frob.item(),
-            f"u_replace_frob/{name}": u_subset_frob.item(),
+            f"u_frob/{name}": u_frob.item(),
             f"o_frob_norm/{name}": o_frob_per_elem.item(),
-            f"u_frob_norm/{name}": u_frob_per_elem.item()
+            f"u_frob_norm/{name}": u_frob_per_elem.item(),
+            f"u2o-norm-ratio/{name}": (u_frob_per_elem / (o_frob_per_elem + 1e-8)).item(),
+            f"u2o-ratio/{name}": (u_frob / (o_frob + 1e-8)).item(),
         }, commit=False)
         # Austin: first do weight decay and then updates
         # split weight_decay based on learning rates
