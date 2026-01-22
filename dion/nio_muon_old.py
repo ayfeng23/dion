@@ -157,7 +157,6 @@ class NioMuon(Optimizer):
         if not state:
             state["momentum"] = torch.zeros_like(param)
             state["gradient_prev"] = torch.zeros_like(param)
-            state["gradient_prev_prev"] = torch.zeros_like(param)
             if algo == "adamw":
                 state["variance"] = torch.zeros_like(param)
         return state
@@ -214,7 +213,6 @@ class NioMuon(Optimizer):
                 states = [self._get_or_initialize_state(p, algo_name) for p in params]
                 momentums = [s["momentum"] for s in states]
                 gradients_prev = [s["gradient_prev"] for s in states]
-                gradients_prev_prev = [s["gradient_prev_prev"] for s in states]
 
                 # Get sharding state for DTensor
                 is_batch_sharded = False
@@ -274,13 +272,12 @@ class NioMuon(Optimizer):
                 # As long as matrix dimensions are not sharded, each device will have whole matrices
                 # Each device already has different matrices of the batch, so we can't parallelize further
                 if is_batch_sharded and not is_matrix_sharded:
-                    for x, g, g_prev, g_prev_prev, m, n in zip(params, gradients, gradients_prev, gradients_prev_prev, momentums, names):
+                    for x, g, g_prev, m, n in zip(params, gradients, gradients_prev, momentums, names):
                         yield AsyncTask(
                             muon_update_batch_async(
                                 X=[x],
                                 G=[g],
                                 G_prev=[g_prev],
-                                G_prev_prev=[g_prev_prev],
                                 M=[m],
                                 names=[n],
                                 shard_dim=None,  # No sharded matrix dim
@@ -294,7 +291,6 @@ class NioMuon(Optimizer):
                             X=pad_batch(params, self._world_size),
                             G=pad_batch(gradients, self._world_size),
                             G_prev=pad_batch(gradients_prev, self._world_size),
-                            G_prev_prev=pad_batch(gradients_prev_prev, self._world_size),
                             M=pad_batch(momentums, self._world_size),
                             names=pad_names(names, self._world_size),
                             shard_dim=sharded_tensor_dim,
@@ -391,7 +387,6 @@ def muon_update_batch_async(
     X: List[Tensor],  # Model weights (modified in place)
     G: List[Tensor],  # Gradient
     G_prev: List[Tensor],
-    G_prev_prev: List[Tensor],
     M: List[Tensor],  # Momentum buffer (modified in place)
     names: List[str],
     lr: Tensor,  # Learning rate (scalar tensor)
@@ -443,22 +438,6 @@ def muon_update_batch_async(
             f"loss_increase/{name}": loss_increase,
             f"loss_increase/{name}_reset": reset,
         }, commit=False)
-
-    osc = G_local[0] - G_prev[0]
-    stable = G_local[0] + G_prev[0]
-    osc_prev = G_prev[0] - G_prev_prev[0]
-    stable_prev = G_prev[0] + G_prev_prev[0]
-
-    bounce_ratio = norm_sq(osc).item() / (norm_sq(osc) + norm_sq(stable)).item()
-    stable_cos = normalized_inner_product(stable, stable_prev).item()
-    osc_cos = normalized_inner_product(osc, osc_prev).item()
-    cross_cos = normalized_inner_product(osc, stable).item()
-    m_stable_cos = normalized_inner_product(M_local[0], stable).item
-    m_osc_cos = normalized_inner_product(M_local[0], osc).item()
-    m_energy_stable = torch.square(normalized_inner_product(M_local[0], stable)).item() / norm_sq(stable).item()
-    m_energy_osc = torch.square(normalized_inner_product(M_local[0], osc)).item() / norm_sq(osc).item()
-
-
     m_g_product = inner_product(M_local[0], G_local[0]).item()
     m_g_cosine = normalized_inner_product(M_local[0], G_local[0]).item()
     g_g_cosine = normalized_inner_product(G_local[0], G_prev[0]).item()
@@ -476,14 +455,6 @@ def muon_update_batch_async(
             f"g_g_cosine/{name}": g_g_cosine,
             f"o_g_product/{name}": o_g_product,
             f"o_g_cosine/{name}": o_g_cosine,
-            f"bounce_ratio/{name}": bounce_ratio,
-            f"stable_cos/{name}": stable_cos,
-            f"osc_cos/{name}": osc_cos,
-            f"cross_cos/{name}": cross_cos,
-            f"m_stable_cos/{name}": m_stable_cos,
-            f"m_osc_cos/{name}": m_osc_cos,
-            f"m_energy_stable/{name}": m_energy_stable,
-            f"m_energy_osc/{name}": m_energy_osc,
         }, commit=False)
         # if "/0." in name:
         #     s = randomized_svdvals_topk(M_local[0], k=20, oversample=8, n_iter=2)  # W on GPU
@@ -493,8 +464,6 @@ def muon_update_batch_async(
 
     for (g_prev, g) in zip(G_prev, G):
         g_prev.copy_(g)
-    for (g_prev_prev, g_prev) in zip(G_prev_prev, G_prev):
-        g_prev_prev.copy_(g_prev)
     # if loss_increase > 0:
     #     torch._foreach_mul_(M, 0)
 
@@ -880,9 +849,6 @@ def zeropower_via_newtonschulz5(G: Tensor, epsilon: float = 1e-7):
 
 def inner_product(A: Tensor, B: Tensor):
     return torch.sum(A * B)
-
-def norm_sq(A: Tensor):
-    return torch.sum(A * A)
 
 def normalized_inner_product(A: Tensor, B: Tensor):
     return torch.sum(A * B) / (torch.sqrt(torch.sum(A * A)) * torch.sqrt(torch.sum(B * B)))

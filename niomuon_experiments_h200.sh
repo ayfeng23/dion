@@ -2,7 +2,7 @@
 #SBATCH --job-name=niomuon_grid
 #SBATCH --output=logs/h200_niomuon_grid_%a.out
 #SBATCH --error=logs/h200_niomuon_grid_%a.err
-#SBATCH --time=2:00:00
+#SBATCH --time=3:00:00
 #SBATCH --partition=gpu_h200
 #SBATCH --cpus-per-gpu=8
 #SBATCH --gpus=h200:1
