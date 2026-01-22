@@ -707,7 +707,7 @@ def dion2_post_orthogonalize(
             f"o_frob_norm/{name}": o_frob_per_elem.item(),
             f"u_frob_norm/{name}": u_frob_per_elem.item()
         }, commit=False)
-        interp = 0#o_frob / u_subset_frob
+        interp = o_frob / u_subset_frob
         # Austin: first do weight decay and then updates
         # split weight_decay based on learning rates
         x_sel = x.index_select(select_dim, idx)
