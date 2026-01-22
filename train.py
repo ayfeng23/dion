@@ -45,6 +45,8 @@ class Hyperparameters:
     num_iterations: int = 5000
     warmup_ratio: float = 0.01
     warmdown_ratio: float = 0.2
+    warmup_iters: int = 500  # If set, uses absolute iterations instead of ratio
+
 
     # Model config
     model_dim: int = 768
@@ -912,7 +914,12 @@ def main():
 
     # Learning rate scheduler
     def get_lr(it):
-        warmup_iters = round(hp.warmup_ratio * hp.num_iterations)
+        # Use absolute warmup_iters if specified, otherwise use warmup_ratio
+        if hp.warmup_iters is not None:
+            warmup_iters = hp.warmup_iters
+        else:
+            warmup_iters = round(hp.warmup_ratio * hp.num_iterations)
+        
         warmdown_iters = round(hp.warmdown_ratio * hp.num_iterations)
         if it < warmup_iters:
             return (it + 1) / warmup_iters
@@ -920,6 +927,15 @@ def main():
             return 1.0
         else:
             return (hp.num_iterations - it) / warmdown_iters
+
+    # Print the actual warmup and warmdown iterations being used
+    actual_warmup_iters = hp.warmup_iters if hp.warmup_iters is not None else round(hp.warmup_ratio * hp.num_iterations)
+    actual_warmdown_iters = round(hp.warmdown_ratio * hp.num_iterations)
+    
+    print0(f"============================================================")
+    print0(f"Learning rate warmup iterations: {actual_warmup_iters}")
+    print0(f"Learning rate warmdown iterations: {actual_warmdown_iters}")
+    print0(f"============================================================")
 
     lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr)
 
@@ -1128,7 +1144,7 @@ def main():
                 {
                     "train/loss": train_loss.item(),
                     "train/grad_norm": grad_norm.item(),
-                    "train/lr": current_lr,
+                    "train/base_lr": lr_scheduler.get_last_lr()[0],
                     "step": step,
                     "time/training_time_ms": approx_time,  # Log approximate elapsed training time in ms
                 }
