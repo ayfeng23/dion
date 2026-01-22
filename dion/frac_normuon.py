@@ -633,7 +633,8 @@ def fracnormuon_pre_orthogonalize(
     torch._foreach_add_(M, G)
 
     #Non-distributed / no-communication for row-sharding
-    U = normuon_front_second_moment(G, M, V, muon_beta2)
+    U = normuon_front_normalization(M, V, muon_beta2)
+    # normuon_front_second_moment(G, M, V, muon_beta2)
 
     U_stacked = torch.stack(U, dim=0)
 
@@ -706,6 +707,7 @@ def dion2_post_orthogonalize(
             f"o_frob_norm/{name}": o_frob_per_elem.item(),
             f"u_frob_norm/{name}": u_frob_per_elem.item()
         }, commit=False)
+        interp = 0#o_frob / u_subset_frob
         # Austin: first do weight decay and then updates
         # split weight_decay based on learning rates
         x_sel = x.index_select(select_dim, idx)
@@ -760,3 +762,28 @@ def _print_selection_choice(
             f"[FracNormuon] Shape {tuple(shape)}: {mode}, {reason} → "
             f"select top-α {select_info} by {norm_info}"
         )
+
+@torch.compile(fullgraph=True)
+def normuon_front_normalization(
+    M_new: List[Tensor],
+    V: List[Tensor],
+    muon_beta2: Tensor,
+) -> List[Tensor]:
+    """
+    NorMuon normalization step after orthogonalization.
+    Inputs and outputs should be lists of regular Tensor, not DTensor.
+    This is a separate function for compatibility with torch.compile().
+    """
+    V_dtype = V[0].dtype
+    M_new = [m_new.to(dtype=V_dtype) for m_new in M_new]
+
+    M_new_sq = torch._foreach_mul(M_new, M_new)  # list of m*m, same shapes as M_new
+    neuron_norms = [m_new_sq.mean(dim=-1, keepdim=True) for m_new_sq in M_new_sq]  # Shape: [*, 1]
+    torch._foreach_lerp_(
+        V, neuron_norms, 1 - muon_beta2
+    )  # Update variance neuron buffer
+
+    denom = torch._foreach_sqrt(V)  # list of sqrt(v)
+    torch._foreach_add_(denom, 1e-8)  # denom[i] += 1e-8
+    normalized_U = torch._foreach_div(M_new, denom)  # list of u / denom
+    return normalized_U

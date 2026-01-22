@@ -46,3 +46,4 @@ lr: 0.02
 
 interp: 0.1
 ef_partial: false
+partial_warmup: true
