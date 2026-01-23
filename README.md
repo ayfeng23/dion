@@ -11,9 +11,9 @@ PRIORITY="high" \
 NODES=1 \
 CONTAINER_IMAGE_PATH="nvcr.io/nvidia/pytorch:25.02-py3" \
 TRANSFER_VARS="WANDB_API_KEY WANDB_ENTITY WANDB_HOST"  \
-JOB_NAME="p0-neuron-test" \
+JOB_NAME="p1-opt-basline22" \
 ENV_SETUP_SCRIPT="setup_env.sh" \
-bash /usr/local/bin/vsubmit.sh train.py --config configs/ahn/fracnormuon_350m.yaml
+bash /usr/local/bin/vsubmit.sh train.py --config configs/ahn/dion2_304m.yaml
 
 ```
 

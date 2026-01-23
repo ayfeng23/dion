@@ -13,6 +13,7 @@ num_iterations: 10000
 # — Learning‐rate schedule —
 warmup_ratio: 0.0
 warmdown_ratio: 0.2
+warmup_iters: 500
 
 # — Optimizer & Hyperparameters —
 mu: 0.95
@@ -24,7 +25,7 @@ val_tokens: 10485760
 save_every: 0
 
 # — Weights & Biases logging —
-wandb_project_name: gpt-train
+wandb_project_name: normuon
 wandb_job_name: null
 no_wandb: false
 
@@ -39,12 +40,11 @@ no_compile: false
 no_triton: false
 
 optimizer: fracnormuon
-ortho_fraction: 0.5
+ortho_fraction: 0.25
 scalar_opt: lion
 adjust_lr: spectral_norm
 lr: 0.02
-
-interp: 0.0
+ 
 ef_partial: false
 partial_warmup: true
 

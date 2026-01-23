@@ -45,7 +45,7 @@ class Hyperparameters:
     num_iterations: int = 5000
     warmup_ratio: float = 0.01
     warmdown_ratio: float = 0.2
-    warmup_iters: int = 500  # If set, uses absolute iterations instead of ratio
+    warmup_iters: int = None  # If set, uses absolute iterations instead of ratio
 
 
     # Model config
