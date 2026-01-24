@@ -2,8 +2,8 @@
 #SBATCH --job-name=normuon_experiments
 #SBATCH --output=logs/fracnormuon_2_%a.out 
 #SBATCH --error=logs/fracnormuon_2_%a.err
-#SBATCH --time=17:00:00
-#SBATCH --partition=gpu_h200
+#SBATCH --time=2:10:00
+#SBATCH --partition=gpu_devel
 #SBATCH --cpus-per-gpu=8
 #SBATCH --gpus=h200:1
 #SBATCH --mem=64G
@@ -14,12 +14,12 @@ module load Python/3.10.8-GCCcore-12.2.0
 
 export WANDB_API_KEY=6847fa93f84b5335cd0ba5f438e6ba60fbe5b76b
 
-CONFIG="configs/fracnormuon_350m.yaml"
+CONFIG="configs/fracnormuon_160m.yaml"
 
 CONFIG_TMP=$(mktemp)
 
-WARMUP=0.0
-ORTHO_FRACTION=0.125
+WARMUP=0.05
+ORTHO_FRACTION=0.25
 PARTIAL_WARMUP=true
 
 sed -E \
