@@ -1,0 +1,51 @@
+
+# — Model —
+model_dim: 1024
+n_layer: 16
+n_head: 8
+sequence_length: 1024
+
+# — Batching & Training —
+batch_size: 1024
+device_batch_size: 128
+num_iterations: 10000
+
+# — Learning‐rate schedule —
+warmup_ratio: 0.0
+warmdown_ratio: 0.2 
+
+# — Optimizer & Hyperparameters —
+mu: 0.95
+momentum: 0.95
+weight_decay: 0.01
+
+# — Validation & Checkpointing —
+val_loss_every: 125
+val_tokens: 10485760
+save_every: 0
+
+# — Weights & Biases logging —
+wandb_project_name: alg-dev
+wandb_job_name: null
+no_wandb: false
+
+# — Distributed training —
+dp_size: null      # data‐parallel size
+fs_size: null      # FSDP size
+tp_size: null      # DO NOT USE TP for NorMuon
+
+# — Miscellaneous flags —
+debug: false
+no_compile: false
+no_triton: false
+
+optimizer: fracnormuon
+ortho_fraction: 1.0
+scalar_opt: adamw
+adjust_lr: spectral_norm
+lr: 0.02
+ 
+ef_partial: false
+partial_warmup: true
+
+data_dir: /data/datasets/fineweb100B 

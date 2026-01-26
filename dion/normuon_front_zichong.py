@@ -29,7 +29,7 @@ from .muon import (
 )
 
 
-class NorMuonFront(Optimizer):
+class NorMuonFrontZC(Optimizer):
     """
     Distributed NorMuon optimizer for PyTorch FSDP2. Also compatible with DDP.
 

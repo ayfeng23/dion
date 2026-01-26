@@ -32,6 +32,7 @@ from dion import NorMuon
 from dion import NorMuonFront
 from dion import FracNormuon
 from dion import FracNormuonAhn
+from dion import NorMuonFrontZC
 
 @dataclass
 class Hyperparameters:
@@ -566,6 +567,33 @@ def init_optimizer(
             adjust_lr=hp.adjust_lr,
             use_triton=(not cli_args.no_triton),
         )
+    elif hp.optimizer == "normuon_zc":
+        if device_mesh is not None:
+            # Ensure that we have a supported device mesh configuration for NorMuonZC Front
+            if inner_shard_mesh is not None and inner_shard_mesh.size() > 1:
+                raise ValueError("Tensor parallel is not supported by NorMuon Front.")
+            distributed_mesh = (
+                outer_shard_mesh if outer_shard_mesh.size() > 1 else replicate_mesh
+            )
+            comm_method = "all-to-all" if outer_shard_mesh.size() > 1 else "all-gather"
+        else:
+            assert ddp_model is not None
+            distributed_mesh = ddp_model.process_group  # using ProcessGroup for DDP
+            comm_method = "all-gather"
+        print0(f"NorMuonZC Front LR adjust method: {hp.adjust_lr}")
+        print0(f"Triton Newton-Schulz kernels: {not cli_args.no_triton}")
+        print0(f"Distributed NorMuonZC Front using: {comm_method}")
+        opt = NorMuonFrontZC(
+            param_groups,
+            distributed_mesh=distributed_mesh,
+            lr=hp.lr,
+            mu=hp.mu,
+            muon_beta2=0.95,
+            weight_decay=hp.weight_decay,
+            nesterov=hp.nesterov,
+            adjust_lr=hp.adjust_lr,
+            use_triton=(not cli_args.no_triton),
+        )
         
     elif hp.optimizer == "fracnormuon":
         if device_mesh is not None:
@@ -622,7 +650,6 @@ def init_optimizer(
             lr=hp.lr,
             fraction=hp.ortho_fraction,
             ef_decay=hp.mu,
-            momentum=hp.momentum,
             muon_beta2=0.95,
             weight_decay=hp.weight_decay,
             interp=hp.interp, 
@@ -980,9 +1007,7 @@ def main():
     # Create a name to identify this run
     optimizer_name = hp.optimizer
     if "dion" in hp.optimizer or "dion2" in hp.optimizer or "fracnormuon" in hp.optimizer or "ahn" in hp.optimizer:
-        optimizer_name = f"{hp.ortho_fraction}-{hp.optimizer}"
-    if "ahn" in hp.optimizer:
-        optimizer_name += f"({hp.momentum}/{hp.mu})"
+        optimizer_name = f"{hp.ortho_fraction}-{hp.optimizer}" 
     run_name = f"({optimizer_name}+{hp.scalar_opt})"
 
     if device_mesh is not None:

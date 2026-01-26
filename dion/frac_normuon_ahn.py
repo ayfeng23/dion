@@ -7,8 +7,7 @@ from torch.distributed import ProcessGroup
 from torch.distributed.tensor import DeviceMesh, DTensor
 from torch.optim.optimizer import Optimizer, ParamsT
 from typing import Callable, Generator, List, Optional, Tuple, Union
-from .muon import muon_update_pre_orthogonalize
-from .normuon_front import normuon_front_second_moment
+from .muon import muon_update_pre_orthogonalize 
 import wandb
 
 from .newton_schulz_triton import newton_schulz_triton, zeropower_via_newtonschulz5
@@ -44,7 +43,7 @@ class FracNormuonAhn(Optimizer):
         weight_decay: float = 0.01,
         epsilon: float = 1e-8,
         interp: float = 1.0,
-        momentum: float = 0.95,
+        ef_partial: bool = True,
         adjust_lr: Optional[str] = "spectral_norm",
         flatten: bool = False,
         use_triton: bool = False,
@@ -80,7 +79,7 @@ class FracNormuonAhn(Optimizer):
             epsilon=epsilon,
             flatten=flatten,
             interp=interp,
-            momentum=momentum,
+            ef_partial=ef_partial,
             adjust_lr=adjust_lr,
             algorithm="fracnormuon",
             # Austin: step needed to see if we reach warmup_cutoff
@@ -215,12 +214,12 @@ class FracNormuonAhn(Optimizer):
             fracnormuon_args = dict(
                 lr=torch.tensor(group["lr"]),
                 ef_decay=torch.tensor(group["ef_decay"]),
-                momentum =torch.tensor(group["momentum"]),
                 fraction=group["fraction"],
                 muon_beta2=torch.tensor(group["muon_beta2"]),
                 weight_decay=torch.tensor(group["weight_decay"]),
                 epsilon=torch.tensor(group["epsilon"]),
                 interp=group["interp"],
+                ef_partial=group["ef_partial"],
                 flatten=group["flatten"],
                 adjust_lr=group["adjust_lr"],
                 full_lr=group["full_lr"],
@@ -417,11 +416,11 @@ def fracnormuon_update_batch_async(
     lr: Tensor,  # Learning rate (scalar tensor)
     muon_beta2: Tensor,
     ef_decay: Tensor,  # Error-feedback factor (scalar tensor)
-    momentum: Tensor,
     fraction: float,  # Fraction of submatrix to orthogonalize (0 < fraction <= 1)
     weight_decay: Tensor,  # Weight decay (scalar tensor)
     epsilon: Tensor,  # Epsilon (scalar tensor)
     interp: float,
+    ef_partial: bool,
     flatten: bool,  # Whether to flatten 3D+ tensors to 2D
     adjust_lr: Optional[str],  # How to adjust learning rate
     device_rank: int,  # Rank of the current device
@@ -446,29 +445,8 @@ def fracnormuon_update_batch_async(
     # For sharded matrices, we align select_dim with shard_dim
     # For unsharded matrices (DDP or single-GPU), we select the shorter dimension
     ndim = X[0].ndim
-    select_dim = None
-
-    if shard_dim is not None:
-        # Normalize shard_dim to negative indexing for unified treatment
-        shard_dim = shard_dim if shard_dim < 0 else shard_dim - ndim
-        if shard_dim == -2:
-            select_dim = -2  # Row-sharded
-        elif shard_dim == -1:
-            select_dim = -1  # Column-sharded
-            # Austin: if shard_dim=-1, this affects neuron_variances
-            raise NotImplementedError(
-                "NorMuon currently does not support parameters sharded along the last dimension. "
-                "Please avoid shards at dim -1."
-            )
-
-    # Fall-back to shorter dimension when DDP, Single-GPU, or batch-sharded
-    if select_dim is None:
-        num_rows, num_cols = X[0].shape[-2:]
-        select_dim = -2 if num_rows <= num_cols else -1
-
-    # Print how the selection choice based on shard_dim and tensor shape
-    if verbose:
-        _print_selection_choice(X[0].shape, shard_dim, select_dim, ndim)
+    # Row-wise choice no matter what
+    select_dim =-2
 
     # Update momentum and select top-α fraction along select_dim
     U, U_selected, indices_list = fracnormuon_pre_orthogonalize(
@@ -476,18 +454,11 @@ def fracnormuon_update_batch_async(
         M=to_local(M),
         V=to_local(V),
         fraction=fraction,
-        momentum=momentum,
         select_dim=select_dim,
         muon_beta2=muon_beta2,
+        momentum = ef_decay,
     )
-
-    # Modified error feedback only updated params 
-    torch._foreach_mul_(M, ef_decay) 
-    # for m, idx in zip(M, indices_list):
-    #     selected_slice = m.index_select(dim=select_dim, index=idx)
-    #     m.index_copy_(dim=select_dim, index=idx, source=selected_slice * ef_decay)
-    
-        
+ 
 
     # Get one whole matrix for each device to orthogonalize
     if shard_dim is not None:
@@ -606,10 +577,9 @@ def fracnormuon_pre_orthogonalize(
     G: List[Tensor],
     M: List[Tensor],
     V: List[Tensor],
-    momentum: Tensor,
-    fraction: float,
-    select_dim: int,
+    fraction: float, 
     muon_beta2: Tensor,
+    momentum: Tensor,
 ) -> Tuple[List[Tensor], List[Tensor], List[Tensor]]:
     """
     Update momentum with gradient and compute the input to orthogonalization.
@@ -627,17 +597,16 @@ def fracnormuon_pre_orthogonalize(
     # norm_dim is the dimension we compute norm over
     # select_dim is the dimension we select submatrix from
     num_select = M[0].size(select_dim)
-    norm_dim = -1 if select_dim == -2 else -2
+    norm_dim = -1 
     k = max(1, int(math.ceil(fraction * num_select)))
 
     # Update momentum: M = M + G
     G = [g.to(dtype=dtype) for g in G]
-    
-    torch._foreach_mul_(M, momentum) 
+    torch._foreach_mul_(M, momentum)
     torch._foreach_add_(M, G)
+
     #Non-distributed / no-communication for row-sharding
-    U = normuon_front_normalization(M, V, muon_beta2)
-    # normuon_front_second_moment(G, M, V, muon_beta2)
+    U = second_moment_normalization(G, M, V, muon_beta2)
 
     U_stacked = torch.stack(U, dim=0)
 
@@ -647,18 +616,11 @@ def fracnormuon_pre_orthogonalize(
     # Batched topk: indices shape (batch_size, k)
     _, indices = torch.topk(slice_norms, k, dim=-1, sorted=False)
 
-    # Batched gather for slice extraction
-    if select_dim == -2:
-        # Selecting rows
-        num_cols = M[0].size(-1)
-        indices_expanded = indices.unsqueeze(-1).expand(-1, -1, num_cols)
-        selected_stacked = torch.gather(U_stacked, dim=-2, index=indices_expanded)
-    else:
-        # Selecting cols
-        num_rows = M[0].size(-2)
-        indices_expanded = indices.unsqueeze(-2).expand(-1, num_rows, -1)
-        selected_stacked = torch.gather(U_stacked, dim=-1, index=indices_expanded)
-
+    # Selecting rows
+    num_cols = M[0].size(-1)
+    indices_expanded = indices.unsqueeze(-1).expand(-1, -1, num_cols)
+    selected_stacked = torch.gather(U_stacked, dim=-2, index=indices_expanded)
+    
     indices_list = list(indices.unbind(dim=0))
     
     # Convert to bf16 and unstack for communication
@@ -710,7 +672,7 @@ def dion2_post_orthogonalize(
             f"o_frob_norm/{name}": o_frob_per_elem.item(),
             f"u_frob_norm/{name}": u_frob_per_elem.item()
         }, commit=False)
-        interp = o_frob / u_subset_frob
+        interp = 1.0
         # Austin: first do weight decay and then updates
         # split weight_decay based on learning rates
         x_sel = x.index_select(select_dim, idx)
@@ -723,65 +685,27 @@ def dion2_post_orthogonalize(
         x_sel.sub_(o * adjusted_full_lr)  
         x.index_copy_(select_dim, idx, x_sel)
 
+ 
 
-# A helper function to print selection chocie for each matrix
-# It only prints once `verbose` is set True
-_printed_configs: set = set()
-
-
-def _print_selection_choice(
-    shape: torch.Size,
-    shard_dim: Optional[int],
-    select_dim: int,
-    ndim: int,
-):
-    config_key = (tuple(shape), shard_dim, select_dim)
-    if config_key not in _printed_configs:
-        _printed_configs.add(config_key)
-
-        num_rows, num_cols = shape[-2:]
-        select_info = "rows" if select_dim == -2 else "columns"
-        norm_info = "row norms" if select_dim == -2 else "col norms"
-
-        if shard_dim is None:
-            mode = "DDP/Single-GPU"
-            shorter = "rows" if num_rows <= num_cols else "cols"
-            reason = f"shorter dim = {shorter} ({min(num_rows, num_cols)})"
-        else:
-            # Normalize shard_dim for display
-            normalized = shard_dim if shard_dim < 0 else shard_dim - ndim
-            if normalized == -2:
-                mode = "FSDP"
-                reason = f"row-sharded (shard_dim={shard_dim}→-2)"
-            elif normalized == -1:
-                mode = "FSDP"
-                reason = f"col-sharded (shard_dim={shard_dim}→-1)"
-            else:
-                mode = "FSDP batch-sharded"
-                shorter = "rows" if num_rows <= num_cols else "cols"
-                reason = f"shard_dim={shard_dim} (batch), shorter = {shorter}"
-
-        print(
-            f"[FracNormuon] Shape {tuple(shape)}: {mode}, {reason} → "
-            f"select top-α {select_info} by {norm_info}"
-        )
 
 @torch.compile(fullgraph=True)
-def normuon_front_normalization(
+def second_moment_normalization(
+    G: List[Tensor],
     M_new: List[Tensor],
     V: List[Tensor],
     muon_beta2: Tensor,
 ) -> List[Tensor]:
     """
-    NorMuon normalization step after orthogonalization.
+    NorMuon second moment step after orthogonalization.
     Inputs and outputs should be lists of regular Tensor, not DTensor.
     This is a separate function for compatibility with torch.compile().
     """
     V_dtype = V[0].dtype
     M_new = [m_new.to(dtype=V_dtype) for m_new in M_new]
+    G_adj = [g.to(dtype=V_dtype) for g in G]
 
-    M_new_sq = torch._foreach_mul(M_new, M_new)  # list of m*m, same shapes as M_new
-    neuron_norms = [m_new_sq.mean(dim=-1, keepdim=True) for m_new_sq in M_new_sq]  # Shape: [*, 1]
+    G_sq = torch._foreach_mul(G_adj, G_adj)  # list of g*g, same shapes as G_adj
+    neuron_norms = [g_sq.mean(dim=-1, keepdim=True) for g_sq in G_sq]  # Shape: [*, 1]
     torch._foreach_lerp_(
         V, neuron_norms, 1 - muon_beta2
     )  # Update variance neuron buffer
@@ -789,4 +713,5 @@ def normuon_front_normalization(
     denom = torch._foreach_sqrt(V)  # list of sqrt(v)
     torch._foreach_add_(denom, 1e-8)  # denom[i] += 1e-8
     normalized_U = torch._foreach_div(M_new, denom)  # list of u / denom
-    return normalized_U
+    normalized_U = [u.to(dtype=torch.bfloat16) for u in normalized_U]
+    return normalized_U 
