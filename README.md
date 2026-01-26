@@ -1,22 +1,37 @@
 # Custom for Kwangjun
 export WANDB_ENTITY="kwangjunahn"
 
+
+High priorities:
 ```bash
-export WANDB_API_KEY="a9dddea045e5426079a23680e449624f771620ec"
-export WANDB_ENTITY="kwangjunahn"
+export WANDB_API_KEY="a9dddea045e5426079a23680e449624f771620ec" 
 export WANDB_HOST="https://microsoft-research.wandb.io"
 
 PROJECT_NAME="orthonormal-updates" \
 PRIORITY="high" \
 NODES=1 \
 CONTAINER_IMAGE_PATH="nvcr.io/nvidia/pytorch:25.02-py3" \
-TRANSFER_VARS="WANDB_API_KEY WANDB_ENTITY WANDB_HOST"  \
-JOB_NAME="p1-opt-basline22" \
+TRANSFER_VARS="WANDB_API_KEY WANDB_HOST"  \
+JOB_NAME="p0-normuon-test" \
 ENV_SETUP_SCRIPT="setup_env.sh" \
-bash /usr/local/bin/vsubmit.sh train.py --config configs/ahn/dion2_304m.yaml
-
+bash /usr/local/bin/vsubmit.sh train.py --config configs/ahn/muon_304m.yaml
 ```
 
+Low priorities: 
+
+```bash
+export WANDB_API_KEY="a9dddea045e5426079a23680e449624f771620ec" 
+export WANDB_HOST="https://microsoft-research.wandb.io"
+
+PROJECT_NAME="orthonormal-updates" \
+PRIORITY="low" \
+NODES=1 \
+CONTAINER_IMAGE_PATH="nvcr.io/nvidia/pytorch:25.02-py3" \
+TRANSFER_VARS="WANDB_API_KEY WANDB_HOST"  \
+JOB_NAME="p1-warmup" \
+ENV_SETUP_SCRIPT="setup_env.sh" \
+bash /usr/local/bin/vsubmit.sh train.py --config configs/ahn/ahn1.yaml
+```
 
 # Welcome to the Microsoft/Dion Codebase
 

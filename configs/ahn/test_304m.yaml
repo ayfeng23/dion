@@ -3,11 +3,11 @@
 model_dim: 1024
 n_layer: 16
 n_head: 8
-sequence_length: 2048
+sequence_length: 1024
 
 # — Batching & Training —
 batch_size: 1024
-device_batch_size: 32
+device_batch_size: 128
 num_iterations: 10000
 
 # — Learning‐rate schedule —
@@ -24,7 +24,7 @@ val_tokens: 10485760
 save_every: 0
 
 # — Weights & Biases logging —
-wandb_project_name: normuon
+wandb_project_name: alg-dev
 wandb_job_name: null
 no_wandb: false
 
@@ -40,7 +40,7 @@ no_triton: false
 
 optimizer: fracnormuon
 ortho_fraction: 0.25
-scalar_opt: lion
+scalar_opt: adamw
 adjust_lr: spectral_norm
 lr: 0.02
  

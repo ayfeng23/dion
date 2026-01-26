@@ -8,3 +8,4 @@ from .dion2 import Dion2
 from .normuon import NorMuon
 from .normuon_front import NorMuonFront
 from .frac_normuon import FracNormuon
+from .frac_normuon_ahn import FracNormuonAhn

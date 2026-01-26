@@ -31,7 +31,7 @@ from dion import Dion2
 from dion import NorMuon
 from dion import NorMuonFront
 from dion import FracNormuon
-
+from dion import FracNormuonAhn
 
 @dataclass
 class Hyperparameters:
@@ -67,6 +67,7 @@ class Hyperparameters:
     # Main optimizer hyperparameters
     lr: float = 0.02
     mu: float = 0.95
+    momentum: float = 0.95
     weight_decay: float = 0.01
     ortho_fraction: float = 0.25
 
@@ -82,7 +83,7 @@ class Hyperparameters:
     nesterov: bool = True
     interp: float = 1.0
     ef_partial: bool = True
-    partial_warmup: bool = True
+    partial_warmup: bool = True 
 
     # For printing out selection choice in Dion2
     verbose: bool = True
@@ -599,6 +600,39 @@ def init_optimizer(
             # verbose=True,
         )
 
+    elif hp.optimizer == "ahn":
+        if device_mesh is not None:
+            # Ensure that we have a supported device mesh configuration
+            if inner_shard_mesh is not None and inner_shard_mesh.size() > 1:
+                raise ValueError("Tensor parallel is not supported by FracnormuonAhn.")
+            distributed_mesh = (
+                outer_shard_mesh if outer_shard_mesh.size() > 1 else replicate_mesh
+            )
+            comm_method = "all-to-all" if outer_shard_mesh.size() > 1 else "all-gather"
+        else:
+            assert ddp_model is not None
+            distributed_mesh = ddp_model.process_group  # using ProcessGroup for DDP
+            comm_method = "all-gather"
+        print0(f"FracnormuonAhn LR adjust method: {hp.adjust_lr}")
+        print0(f"Triton Newton-Schulz kernels: {not cli_args.no_triton}")
+        print0(f"Distributed FracnormuonAhn using: {comm_method}")
+        opt = FracNormuonAhn(
+            param_groups,
+            distributed_mesh=distributed_mesh,
+            lr=hp.lr,
+            fraction=hp.ortho_fraction,
+            ef_decay=hp.mu,
+            momentum=hp.momentum,
+            muon_beta2=0.95,
+            weight_decay=hp.weight_decay,
+            interp=hp.interp, 
+            partial_warmup=hp.partial_warmup,
+            adjust_lr=hp.adjust_lr,
+            use_triton=(not cli_args.no_triton),
+            warmup_cutoff=round(hp.warmup_ratio * hp.num_iterations),
+            # verbose=True,
+        )    
+
     elif hp.optimizer == "dion_simple":
         assert device_mesh is None, f"{hp.optimizer} does not support device mesh"
         print0(f"Dion rank fraction: {hp.ortho_fraction}")
@@ -945,9 +979,10 @@ def main():
     # Load hyperparameters and update with CLI arguments
     # Create a name to identify this run
     optimizer_name = hp.optimizer
-    if "dion" in hp.optimizer or "dion2" in hp.optimizer or "fracnormuon" in hp.optimizer:
+    if "dion" in hp.optimizer or "dion2" in hp.optimizer or "fracnormuon" in hp.optimizer or "ahn" in hp.optimizer:
         optimizer_name = f"{hp.ortho_fraction}-{hp.optimizer}"
-
+    if "ahn" in hp.optimizer:
+        optimizer_name += f"({hp.momentum}/{hp.mu})"
     run_name = f"({optimizer_name}+{hp.scalar_opt})"
 
     if device_mesh is not None:
