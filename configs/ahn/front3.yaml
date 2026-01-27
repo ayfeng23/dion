@@ -39,7 +39,7 @@ debug: false
 no_compile: false
 no_triton: false
 
-optimizer: normuon
+optimizer: ahn
 ortho_fraction: 0.25
 scalar_opt: adamw
 adjust_lr: spectral_norm

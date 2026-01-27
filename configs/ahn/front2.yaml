@@ -39,8 +39,8 @@ debug: false
 no_compile: false
 no_triton: false
 
-optimizer: fracnormuon
-ortho_fraction: 1.0
+optimizer: ahn
+ortho_fraction: 0.5
 scalar_opt: adamw
 adjust_lr: spectral_norm
 lr: 0.02

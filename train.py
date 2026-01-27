@@ -651,13 +651,9 @@ def init_optimizer(
             fraction=hp.ortho_fraction,
             ef_decay=hp.mu,
             muon_beta2=0.95,
-            weight_decay=hp.weight_decay,
-            interp=hp.interp, 
-            partial_warmup=hp.partial_warmup,
+            weight_decay=hp.weight_decay, 
             adjust_lr=hp.adjust_lr,
-            use_triton=(not cli_args.no_triton),
-            warmup_cutoff=round(hp.warmup_ratio * hp.num_iterations),
-            # verbose=True,
+            use_triton=(not cli_args.no_triton),  
         )    
 
     elif hp.optimizer == "dion_simple":
