@@ -606,8 +606,7 @@ def fracnormuon_pre_orthogonalize(
     torch._foreach_add_(M, G)
 
     #Non-distributed / no-communication for row-sharding
-    U = normuon_front_normalization(M, V, muon_beta2)
-    # normuon_front_second_moment(G, M, V, muon_beta2)
+    U = normuon_front_second_moment(G, M, V, muon_beta2)
 
     U_stacked = torch.stack(U, dim=0)
 
@@ -679,7 +678,7 @@ def dion2_post_orthogonalize(
         # split weight_decay based on learning rates
         x_sel = x.index_select(select_dim, idx)
         x.mul_(1 - base_lr * weight_decay)
-        x_sel.mul_(1 - full_lr * weight_decay)
+        x_sel.mul_(1 - full_lr * weight_decay) #full_lr to avoid warmup issues
         x.index_copy_(select_dim, idx, x_sel)
 
         x_sel = x.index_select(select_dim, idx) 
@@ -713,3 +712,44 @@ def normuon_front_normalization(
     torch._foreach_add_(denom, 1e-8)  # denom[i] += 1e-8
     normalized_U = torch._foreach_div(M_new, denom)  # list of u / denom
     return normalized_U
+# A helper function to print selection chocie for each matrix
+# It only prints once `verbose` is set True
+_printed_configs: set = set()
+
+
+def _print_selection_choice(
+    shape: torch.Size,
+    shard_dim: Optional[int],
+    select_dim: int,
+    ndim: int,
+):
+    config_key = (tuple(shape), shard_dim, select_dim)
+    if config_key not in _printed_configs:
+        _printed_configs.add(config_key)
+
+        num_rows, num_cols = shape[-2:]
+        select_info = "rows" if select_dim == -2 else "columns"
+        norm_info = "row norms" if select_dim == -2 else "col norms"
+
+        if shard_dim is None:
+            mode = "DDP/Single-GPU"
+            shorter = "rows" if num_rows <= num_cols else "cols"
+            reason = f"shorter dim = {shorter} ({min(num_rows, num_cols)})"
+        else:
+            # Normalize shard_dim for display
+            normalized = shard_dim if shard_dim < 0 else shard_dim - ndim
+            if normalized == -2:
+                mode = "FSDP"
+                reason = f"row-sharded (shard_dim={shard_dim}→-2)"
+            elif normalized == -1:
+                mode = "FSDP"
+                reason = f"col-sharded (shard_dim={shard_dim}→-1)"
+            else:
+                mode = "FSDP batch-sharded"
+                shorter = "rows" if num_rows <= num_cols else "cols"
+                reason = f"shard_dim={shard_dim} (batch), shorter = {shorter}"
+
+        print(
+            f"[FracNormuon] Shape {tuple(shape)}: {mode}, {reason} → "
+            f"select top-α {select_info} by {norm_info}"
+        )

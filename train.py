@@ -819,6 +819,8 @@ def main():
     hp = Hyperparameters()
     hp = override_args_from_cli(hp, cli_args)
 
+    hp.lr = float(hp.lr)
+
     if hp.checkpoint_freq > 0:
         if not hp.checkpoint_dir:
             raise ValueError("Must specify --checkpoint_dir to save checkpoints")
