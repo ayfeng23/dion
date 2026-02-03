@@ -447,8 +447,28 @@ def fracnormuon_update_batch_async(
     # For unsharded matrices (DDP or single-GPU), we select the shorter dimension
     ndim = X[0].ndim
     select_dim = -2
+    # select_dim = None
+    # if shard_dim is not None:
+    #     # Normalize shard_dim to negative indexing for unified treatment
+    #     shard_dim = shard_dim if shard_dim < 0 else shard_dim - ndim
+    #     if shard_dim == -2:
+    #         select_dim = -2  # Row-sharded
+    #     elif shard_dim == -1:
+    #         select_dim = -1  # Column-sharded
+    #         # Austin: if shard_dim=-1, this affects neuron_variances
+    #         raise NotImplementedError(
+    #             "NorMuon currently does not support parameters sharded along the last dimension. "
+    #             "Please avoid shards at dim -1."
+    #         )
+    # if select_dim is None:
+    #     num_rows, num_cols = X[0].shape[-2:]
+    #     select_dim = -2 if num_rows <= num_cols else -1
 
-    # Update momentum and select top-α fraction along select_dim
+    # # Update momentum and select top-α fraction along select_dim
+    # num_select = to_local(M)[0].size(select_dim)
+    # print("M", to_local(M)[0].size(), "Select Dim", select_dim)
+    # k = max(1, int(math.ceil(fraction * num_select)))
+    # print("K",k)
     U, U_selected, indices_list = fracnormuon_pre_orthogonalize(
         G=to_local(G),
         M=to_local(M),
@@ -459,7 +479,13 @@ def fracnormuon_update_batch_async(
     )
 
     # Austin: error feedback only updated params
-    torch._foreach_mul_(M, ef_decay)
+    # torch._foreach_mul_(M, ef_decay)
+    if interp == 0:
+        for m, idx in zip(M, indices_list):
+            selected_slice = m.index_select(dim=select_dim, index=idx)
+            m.index_copy_(dim=select_dim, index=idx, source=selected_slice * ef_decay)
+    else:
+        torch._foreach_mul_(M, ef_decay)
 
     # Get one whole matrix for each device to orthogonalize
     if shard_dim is not None:
@@ -687,31 +713,6 @@ def dion2_post_orthogonalize(
         x.index_copy_(select_dim, idx, x_sel)
  
 
-
-@torch.compile(fullgraph=True)
-def normuon_front_normalization(
-    M_new: List[Tensor],
-    V: List[Tensor],
-    muon_beta2: Tensor,
-) -> List[Tensor]:
-    """
-    NorMuon normalization step after orthogonalization.
-    Inputs and outputs should be lists of regular Tensor, not DTensor.
-    This is a separate function for compatibility with torch.compile().
-    """
-    V_dtype = V[0].dtype
-    M_new = [m_new.to(dtype=V_dtype) for m_new in M_new]
-
-    M_new_sq = torch._foreach_mul(M_new, M_new)  # list of m*m, same shapes as M_new
-    neuron_norms = [m_new_sq.mean(dim=-1, keepdim=True) for m_new_sq in M_new_sq]  # Shape: [*, 1]
-    torch._foreach_lerp_(
-        V, neuron_norms, 1 - muon_beta2
-    )  # Update variance neuron buffer
-
-    denom = torch._foreach_sqrt(V)  # list of sqrt(v)
-    torch._foreach_add_(denom, 1e-8)  # denom[i] += 1e-8
-    normalized_U = torch._foreach_div(M_new, denom)  # list of u / denom
-    return normalized_U
 # A helper function to print selection chocie for each matrix
 # It only prints once `verbose` is set True
 _printed_configs: set = set()
