@@ -42,7 +42,7 @@ optimizer: fracnormuon
 ortho_fraction: 0.75
 scalar_opt: lion
 adjust_lr: spectral_norm
-lr: 0.001
+lr: 0.02
 
 interp: 1.0
 ef_partial: false

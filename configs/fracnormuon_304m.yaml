@@ -11,7 +11,7 @@ device_batch_size: 32
 num_iterations: 10000
 
 # — Learning‐rate schedule —
-warmup_ratio: 0.0
+warmup_ratio: 0.05
 warmdown_ratio: 0.2
 
 # — Optimizer & Hyperparameters —
@@ -44,6 +44,6 @@ scalar_opt: lion
 adjust_lr: spectral_norm
 lr: 0.02
 
-interp: 0.0
+interp: 1.0
 ef_partial: false
 partial_warmup: true

@@ -447,28 +447,7 @@ def fracnormuon_update_batch_async(
     # For unsharded matrices (DDP or single-GPU), we select the shorter dimension
     ndim = X[0].ndim
     select_dim = -2
-    # select_dim = None
-    # if shard_dim is not None:
-    #     # Normalize shard_dim to negative indexing for unified treatment
-    #     shard_dim = shard_dim if shard_dim < 0 else shard_dim - ndim
-    #     if shard_dim == -2:
-    #         select_dim = -2  # Row-sharded
-    #     elif shard_dim == -1:
-    #         select_dim = -1  # Column-sharded
-    #         # Austin: if shard_dim=-1, this affects neuron_variances
-    #         raise NotImplementedError(
-    #             "NorMuon currently does not support parameters sharded along the last dimension. "
-    #             "Please avoid shards at dim -1."
-    #         )
-    # if select_dim is None:
-    #     num_rows, num_cols = X[0].shape[-2:]
-    #     select_dim = -2 if num_rows <= num_cols else -1
 
-    # # Update momentum and select top-α fraction along select_dim
-    # num_select = to_local(M)[0].size(select_dim)
-    # print("M", to_local(M)[0].size(), "Select Dim", select_dim)
-    # k = max(1, int(math.ceil(fraction * num_select)))
-    # print("K",k)
     U, U_selected, indices_list = fracnormuon_pre_orthogonalize(
         G=to_local(G),
         M=to_local(M),
