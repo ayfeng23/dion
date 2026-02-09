@@ -987,6 +987,14 @@ def main():
         else:
             return (hp.num_iterations - it) / warmdown_iters
 
+    def scalar_no_warmup(it):
+        warmdown_iters = round(hp.warmdown_ratio * hp.num_iterations)
+
+        if it <= hp.num_iterations - warmdown_iters:
+            return 1.0
+        else:
+            return (hp.num_iterations - it) / warmdown_iters
+
     # Print the actual warmup and warmdown iterations being used
     actual_warmup_iters = hp.warmup_iters if hp.warmup_iters is not None else round(hp.warmup_ratio * hp.num_iterations)
     actual_warmdown_iters = round(hp.warmdown_ratio * hp.num_iterations)
@@ -996,7 +1004,18 @@ def main():
     print0(f"Learning rate warmdown iterations: {actual_warmdown_iters}")
     print0(f"============================================================")
 
-    lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr)
+    lambdas = []
+    for g in optimizer.param_groups:
+        if hp.optimizer not in ("lion", "adamw"): # So only scalar param groups pass through for matrix optimizer
+            if g.get("algorithm") in ("lion", "adamw"):
+                lambdas.append(scalar_no_warmup)
+            else:
+                lambdas.append(get_lr) 
+        else:
+            lambdas.append(get_lr)
+
+    lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambdas)
+    # lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr)
 
     print0("=" * 80)
 

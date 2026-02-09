@@ -28,6 +28,7 @@ from .muon import (
     muon_update_newton_schulz,
     adjust_lr_spectral_norm,
     adjust_lr_rms_norm,
+    muon_update_post_orthogonalize,
 )
 
 
@@ -455,16 +456,17 @@ def fracnormuon_update_batch_async(
         fraction=fraction,
         select_dim=select_dim,
         muon_beta2=muon_beta2,
+        ef_decay=ef_decay,
     )
 
     # Austin: error feedback only updated params
     # torch._foreach_mul_(M, ef_decay)
-    if interp == 0:
-        for m, idx in zip(M, indices_list):
-            selected_slice = m.index_select(dim=select_dim, index=idx)
-            m.index_copy_(dim=select_dim, index=idx, source=selected_slice * ef_decay)
-    else:
-        torch._foreach_mul_(M, ef_decay)
+    # if interp == 0:
+    #     for m, idx in zip(M, indices_list):
+    #         selected_slice = m.index_select(dim=select_dim, index=idx)
+    #         m.index_copy_(dim=select_dim, index=idx, source=selected_slice * ef_decay)
+    # else:
+    #     torch._foreach_mul_(M, ef_decay)
 
     # Get one whole matrix for each device to orthogonalize
     if shard_dim is not None:
@@ -557,7 +559,6 @@ def fracnormuon_update_batch_async(
     else:
         raise ValueError(f"Unknown adjust_lr: {adjust_lr}")
 
-    # print("LR", full_lr, lr) # Austin: checking if full_lr actually is the right lr and it is
     dion2_post_orthogonalize(
         X=to_local(X),
         O=O,
@@ -586,6 +587,7 @@ def fracnormuon_pre_orthogonalize(
     fraction: float,
     select_dim: int,
     muon_beta2: Tensor,
+    ef_decay: float,
 ) -> Tuple[List[Tensor], List[Tensor], List[Tensor]]:
     """
     Update momentum with gradient and compute the input to orthogonalization.
@@ -608,6 +610,9 @@ def fracnormuon_pre_orthogonalize(
 
     # Update momentum: M = M + G
     G = [g.to(dtype=dtype) for g in G]
+
+    torch._foreach_mul_(M, ef_decay)
+
     torch._foreach_add_(M, G)
 
     #Non-distributed / no-communication for row-sharding
@@ -679,6 +684,14 @@ def dion2_post_orthogonalize(
             f"u_frob_norm/{name}": u_frob_per_elem.item()
         }, commit=False)
         interp = o_frob / u_subset_frob
+        # o_frob / u_subset_frob << 1. 
+        # o_subset_rms / (complement of u_subset)_rms > 1
+
+        # Current before / after
+        # Idea: RMS of selected / nonselected, u_subset_frob / complement of u_subset_frob
+        # complement is unselected = U / u_subset
+        # Different size, so use dimension independent
+
         # Austin: first do weight decay and then updates
         # split weight_decay based on learning rates
         x_sel = x.index_select(select_dim, idx)
