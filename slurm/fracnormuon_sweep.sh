@@ -3,11 +3,11 @@
 #SBATCH --output=logs/h200_fraction_%a.out 
 #SBATCH --error=logs/h200_fraction_%a.err
 #SBATCH --time=2:05:00
-#SBATCH --partition=gpu_h200
+#SBATCH --partition=gpu_devel
 #SBATCH --cpus-per-gpu=8
 #SBATCH --gpus=h200:1
 #SBATCH --mem=64G
-#SBATCH --array=0-4                 # Creates 3 sub-jobs
+#SBATCH --array=0                 # Creates 3 sub-jobs
 export PATH="$HOME/.local/bin:$PATH"
 source .venv/bin/activate
 module load Python/3.10.8-GCCcore-12.2.0

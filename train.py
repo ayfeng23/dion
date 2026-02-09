@@ -82,7 +82,6 @@ class Hyperparameters:
 
     # Austin Fracnormuon Grid Parameters
     nesterov: bool = True
-    interp: float = 1.0
     ef_partial: bool = True
     partial_warmup: bool = True 
 
@@ -370,34 +369,6 @@ def init_optimizer(
             assert p not in seen, f"Param in multiple groups: {name_of.get(p, '<unnamed>')}"
             seen.add(p)
 
-    # # Separate the model's parameters based on their types
-    # matrix_params = list(model.transformer.h.parameters())
-    # embedding_params = list(model.transformer.wte.parameters())
-    # lm_head_params = list(model.lm_head.parameters())
-
-    # # Matrix params use optimizer default settings
-    # param_groups = [dict(params=matrix_params)]
-
-    # # Add additional param groups with the necessary configurations for scalar params
-    # param_groups.append(
-    #     dict(
-    #         params=embedding_params,
-    #         algorithm=hp.scalar_opt,
-    #         lr=hp.lr,  # no LR adjustment for embedding parameters
-    #         betas=(0.95, 0.98),
-    #         weight_decay=0,  # no weight decay for embedding parameters
-    #     )
-    # )
-    # param_groups.append(
-    #     dict(
-    #         params=lm_head_params,
-    #         algorithm=hp.scalar_opt,
-    #         lr=hp.lr / math.sqrt(hp.model_dim),  # scale LR for lm_head
-    #         betas=(0.95, 0.98),
-    #         weight_decay=0,  # no weight decay for lm_head parameters
-    #     )
-    # )
-
     # Create the main optimizer
     if device_mesh is not None:
         replicate_mesh = device_mesh["dp"]
@@ -619,13 +590,10 @@ def init_optimizer(
             ef_decay=hp.mu,
             muon_beta2=0.95,
             weight_decay=hp.weight_decay,
-            interp=hp.interp,
-            ef_partial=hp.ef_partial,
             partial_warmup=hp.partial_warmup,
             adjust_lr=hp.adjust_lr,
             use_triton=(not cli_args.no_triton),
             warmup_cutoff=round(hp.warmup_ratio * hp.num_iterations),
-            # verbose=True,
         )
 
     elif hp.optimizer == "ahn":
