@@ -2,7 +2,7 @@
 #SBATCH --job-name=normuon_experiments
 #SBATCH --output=logs/fracnormuon_2_%a.out 
 #SBATCH --error=logs/fracnormuon_2_%a.err
-#SBATCH --time=2:10:00
+#SBATCH --time=0:10:00
 #SBATCH --partition=gpu_devel
 #SBATCH --cpus-per-gpu=8
 #SBATCH --gpus=h200:1

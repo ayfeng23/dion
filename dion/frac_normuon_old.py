@@ -16,9 +16,7 @@ from .opt_utils import (
     AsyncRuntime,
     AsyncTask,
     create_param_batches,
-    create_named_batches,
     pad_batch,
-    pad_names,
     to_local,
 )
 from .scalar_opts import adamw_update_foreach_async, lion_update_foreach_async
@@ -44,17 +42,13 @@ class FracNormuon(Optimizer):
         betas: Tuple[float, float] = (0.9, 0.95),
         weight_decay: float = 0.01,
         epsilon: float = 1e-8,
-        interp: float = 1.0,
-        ef_partial: bool = True,
         adjust_lr: Optional[str] = "spectral_norm",
         flatten: bool = False,
         use_triton: bool = False,
         newton_schulz_func: Optional[Callable] = None,
         verbose: bool = False,
-        # Austin: partial_warmup determines whether to use warmup on all updates (False) or orthonormalized ones (True)
-        partial_warmup: bool = True, 
-        # Austin: warmup_cutoff is an auxiliary variable to ensure partial_warmup logic only affects warmup (and not warmdown crucially)
-        warmup_cutoff: int = 0, 
+        partial_warmup: bool = True, # Austin: partial_warmup determines whether to use warmup on all updates (False) or orthonormalized ones (True)
+        warmup_cutoff: int = 0, # Austin: warmup_cutoff is an auxiliary variable to ensure partial_warmup logic only affects warmup (and not warmdown crucially)
     ):
         # Validate hyperparameters
         if lr < 0.0:
@@ -80,15 +74,11 @@ class FracNormuon(Optimizer):
             weight_decay=weight_decay,
             epsilon=epsilon,
             flatten=flatten,
-            interp=interp,
-            ef_partial=ef_partial,
             adjust_lr=adjust_lr,
             algorithm="fracnormuon",
-            # Austin: step needed to see if we reach warmup_cutoff
             step=0,
             warmup_cutoff=warmup_cutoff,
-            # Austin: store warmup-non-adjusted learning rate
-            full_lr=torch.tensor(lr) if partial_warmup else None,
+            full_lr=torch.tensor(lr) if partial_warmup else None,# Austin: store warmup-non-adjusted learning rate
         )
         super().__init__(params, defaults)
 
@@ -197,17 +187,9 @@ class FracNormuon(Optimizer):
                 p.ndim >= 2 for p in group["params"]
             ), "Fracnormuon only supports matrix parameters."
 
-            if "param_names" in group:
-                group_items = [
-                    (p, n)
-                    for p, n in zip(group["params"], group["param_names"])
-                    if p.grad is not None
-                ]
-            else:
-                group_items = [(p, "<unnamed>") for p in group["params"] if p.grad is not None]
+            group_params = [p for p in group["params"] if p.grad is not None]
 
-            # group_params = [p for p in group["params"] if p.grad is not None]
-            if not group_items:
+            if not group_params:
                 continue
 
             # Most hyperparameters as tensors for torch.compile
@@ -220,8 +202,6 @@ class FracNormuon(Optimizer):
                 muon_beta2=torch.tensor(group["muon_beta2"]),
                 weight_decay=torch.tensor(group["weight_decay"]),
                 epsilon=torch.tensor(group["epsilon"]),
-                interp=group["interp"],
-                ef_partial=group["ef_partial"],
                 flatten=group["flatten"],
                 adjust_lr=group["adjust_lr"],
                 full_lr=group["full_lr"],
@@ -234,9 +214,7 @@ class FracNormuon(Optimizer):
             )
 
             # Create batches of parameters of size self._world_size
-            for batch in create_named_batches(group_items, batch_size=self._world_size):
-                params = [p for p, _ in batch]
-                names  = [n for _, n in batch]
+            for params in create_param_batches(group_params, batch_size=self._world_size):
                 gradients = [p.grad for p in params]
                 states = [self._get_or_initialize_state(p, "fracnormuon") for p in params]
                 momentums = [s["momentum"] for s in states]
@@ -306,7 +284,6 @@ class FracNormuon(Optimizer):
                                 X=[x],
                                 G=[g],
                                 M=[m],
-                                names=[n],
                                 V=[v],
                                 shard_dim=None,  # No sharded matrix dim
                                 **fracnormuon_args,
@@ -320,7 +297,6 @@ class FracNormuon(Optimizer):
                             X=pad_batch(params, self._world_size),
                             G=pad_batch(gradients, self._world_size),
                             M=pad_batch(momentums, self._world_size),
-                            names=pad_names(names, self._world_size),
                             V=pad_batch(variances, self._world_size),
                             shard_dim=sharded_tensor_dim,
                             **fracnormuon_args,
@@ -413,7 +389,6 @@ def fracnormuon_update_batch_async(
     X: List[Tensor],  # Model weights (modified in place)
     G: List[Tensor],  # Gradient
     M: List[Tensor],  # Momentum buffer (modified in place)
-    names: List[str], # Name of Tensor parameters
     V: List[Tensor],
     lr: Tensor,  # Learning rate (scalar tensor)
     muon_beta2: Tensor,
@@ -421,8 +396,6 @@ def fracnormuon_update_batch_async(
     fraction: float,  # Fraction of submatrix to orthogonalize (0 < fraction <= 1)
     weight_decay: Tensor,  # Weight decay (scalar tensor)
     epsilon: Tensor,  # Epsilon (scalar tensor)
-    interp: float,
-    ef_partial: bool,
     flatten: bool,  # Whether to flatten 3D+ tensors to 2D
     adjust_lr: Optional[str],  # How to adjust learning rate
     device_rank: int,  # Rank of the current device
@@ -458,15 +431,6 @@ def fracnormuon_update_batch_async(
         muon_beta2=muon_beta2,
         ef_decay=ef_decay,
     )
-
-    # Austin: error feedback only updated params
-    # torch._foreach_mul_(M, ef_decay)
-    # if interp == 0:
-    #     for m, idx in zip(M, indices_list):
-    #         selected_slice = m.index_select(dim=select_dim, index=idx)
-    #         m.index_copy_(dim=select_dim, index=idx, source=selected_slice * ef_decay)
-    # else:
-    #     torch._foreach_mul_(M, ef_decay)
 
     # Get one whole matrix for each device to orthogonalize
     if shard_dim is not None:
@@ -544,6 +508,16 @@ def fracnormuon_update_batch_async(
                 U_selected[0], newton_schulz_func, flatten=flatten, epsilon=epsilon
             )
         ]
+        full_O = [
+            muon_update_newton_schulz(
+                U[0], newton_schulz_func, flatten=flatten, epsilon=epsilon
+            )
+        ]
+        full_o_frob, sel_o_frob, = full_O[0].norm(p="fro").item(), O[0].norm(p="fro").item()
+        # print("Full O Norm: ", full_o_frob)
+        # print("Sel O Norm: ", sel_o_frob)
+        # print("Unsel O Norm", math.sqrt(full_o_frob ** 2 - sel_o_frob ** 2))
+
 
     # Compute scaled learning rate
     # Do this before to_local(X) because we use the full tensor shape, not the shard shape
@@ -559,7 +533,7 @@ def fracnormuon_update_batch_async(
     else:
         raise ValueError(f"Unknown adjust_lr: {adjust_lr}")
 
-    dion2_post_orthogonalize(
+    fracnormuon_post_orthogonalize(
         X=to_local(X),
         O=O,
         U=U, 
@@ -568,17 +542,11 @@ def fracnormuon_update_batch_async(
         adjusted_lr=adjusted_lr,
         weight_decay=weight_decay,
         select_dim=select_dim,
-        interp=interp,
         full_lr=full_lr,
         adjusted_full_lr=adjusted_full_lr,
-        # Austin: full_lr is not None occurs only when we use partial_warmup for the run, step < warmup_cutoff so that orthonormalized parts can warm down
         partial_warmup=(full_lr is not None) and (step < warmup_cutoff),
         process_group=process_group,
         device_rank=device_rank,
-        names=names,
-        newton_schulz_func=newton_schulz_func,
-        flatten=flatten,
-        epsilon=epsilon,
     )
 
 
@@ -614,7 +582,7 @@ def fracnormuon_pre_orthogonalize(
     # Update momentum: M = M + G
     G = [g.to(dtype=dtype) for g in G]
 
-    torch._foreach_mul_(M, ef_decay)
+    torch._foreach_mul_(M, ef_decay) #ef_decay here
 
     torch._foreach_add_(M, G)
 
@@ -633,7 +601,7 @@ def fracnormuon_pre_orthogonalize(
     num_cols = M[0].size(-1)
     indices_expanded = indices.unsqueeze(-1).expand(-1, -1, num_cols)
     selected_stacked = torch.gather(U_stacked, dim=-2, index=indices_expanded)
-
+    
     indices_list = list(indices.unbind(dim=0))
     
     # Convert to bf16 and unstack for communication
@@ -641,8 +609,8 @@ def fracnormuon_pre_orthogonalize(
 
     return [u.clone() for u in U], U_selected, indices_list
 
-# @torch.compile(fullgraph=True)
-def dion2_post_orthogonalize(
+@torch.compile(fullgraph=True)
+def fracnormuon_post_orthogonalize(
     X: List[Tensor],
     O: List[Tensor],
     U: List[Tensor],
@@ -651,72 +619,34 @@ def dion2_post_orthogonalize(
     adjusted_lr: Tensor,
     weight_decay: Tensor,
     select_dim: int,
-    interp: float,
     full_lr: Optional[Tensor],
     adjusted_full_lr: Optional[Tensor],
     partial_warmup: bool,
     process_group: Optional[ProcessGroup],
     device_rank: int,
-    names: List[str],
-    newton_schulz_func: Optional[Callable] = None,
-    flatten: bool = False,
-    epsilon: float = 1e-8,
 ):
     dtype = X[0].dtype
-    # assert len(X) == 1
     O = [o.to(dtype=dtype) for o in O]
     U = [u.to(dtype=dtype) for u in U]
     if not partial_warmup: #default to full updates (mostly for warmdown)
         full_lr = base_lr
         adjusted_full_lr = adjusted_lr
 
-    for x, o, u, name, idx in zip(X, O, U, names, indices):
-        # Austin: O is NS(U) and U=Adam-Normalized(M)
-        # u_subset is the "replaced" part of U
+    for x, o, u, idx in zip(X, O, U, indices):
+        # Austin: O is NS(U) and U=Adam-Normalized(M), u_subset is the "replaced" part of U
         o_frob = o.norm(p="fro")
-        o_frob_per_elem = o_frob / math.sqrt(o.numel())
-        u_frob = u.norm(p="fro")
         u_subset = u.index_select(select_dim, idx)
         u_subset_frob = u_subset.norm(p="fro")
-        u_frob_per_elem = u.norm(p="fro") / math.sqrt(x.numel())
-        o_full = muon_update_newton_schulz(
-                    u, newton_schulz_func, flatten=flatten, epsilon=epsilon
-                )
-        o_full_frob = o_full.norm(p="fro")
-        o_full_frob_per_elem = o_full_frob / math.sqrt(o_full.numel())
 
-        # if process_group is None or device_rank == 0: 
-            # Austin: under DDP, I assume this gets the "whole batch", because you accum gradient anyway?
-            # And you don't need to shard params?
-        u_unsel_frob = math.sqrt(u_frob.item() ** 2 - u_subset_frob.item() ** 2)
-        if o_full_frob > o_frob:
-            o_unsel_frob = math.sqrt(o_full_frob.item() ** 2 - o_frob.item() ** 2)
-            interp = o_unsel_frob / u_unsel_frob
-        else:
-            o_unsel_frob = -1
+        #Extra Tests
+        # u_frob = u.norm(p="fro")
+        # u_not_subset_frob = torch.sqrt(u_frob.pow(2) - u_subset_frob.pow(2))
+        # m, k = x.size(select_dim), idx.numel()
+        # theor_frob = math.sqrt(m**2 - k**2)
+        # interp = (o_frob / torch.sqrt(torch.tensor(o.numel()))) / (u_not_subset_frob / torch.sqrt(torch.tensor(u.numel() - u_subset.numel())))
         interp = o_frob / u_subset_frob
-        wandb.log({
-            f"u_frob/{name}": u_frob.item(),
-            f"o_full_frob/{name}": o_full_frob.item(),
-            f"o_frob/{name}": o_frob.item(),
-            f"u_subset_frob/{name}": u_subset_frob.item(),
-            f"u_unsel_frob/{name}": u_unsel_frob, 
-            f"o_unsel_frob/{name}": o_unsel_frob, 
-            f"o_frob_norm/{name}": o_frob_per_elem.item(),
-            f"u_frob_norm/{name}": u_frob_per_elem.item()
-        }, commit=False)
-        
-        # interp = o_frob / u_subset_frob
-        # o_frob / u_subset_frob << 1. 
-        # o_subset_rms / (complement of u_subset)_rms > 1
 
-        # Current before / after
-        # Idea: RMS of selected / nonselected, u_subset_frob / complement of u_subset_frob
-        # complement is unselected = U / u_subset
-        # Different size, so use dimension independent
-
-        # Austin: first do weight decay and then updates
-        # split weight_decay based on learning rates
+        # Austin: first do weight decay and then updates, split weight_decay based on learning rates
         x_sel = x.index_select(select_dim, idx)
         x.mul_(1 - base_lr * weight_decay)
         x_sel.mul_(1 - full_lr * weight_decay) #full_lr to avoid warmup issues

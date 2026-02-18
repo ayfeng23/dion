@@ -1,18 +1,18 @@
 #!/bin/bash
 #SBATCH --job-name=normuon_experiments
-#SBATCH --output=logs/h200_fraction_%a.out 
-#SBATCH --error=logs/h200_fraction_%a.err
-#SBATCH --time=2:05:00
-#SBATCH --partition=gpu_devel
+#SBATCH --output=logs/fraction_%a.out 
+#SBATCH --error=logs/fraction_%a.err
+#SBATCH --time=4:05:00
+#SBATCH --partition=gpu_h200
 #SBATCH --cpus-per-gpu=8
 #SBATCH --gpus=h200:1
 #SBATCH --mem=64G
-#SBATCH --array=0                 # Creates 3 sub-jobs
+#SBATCH --array=0-1                # Creates 3 sub-jobs
 export PATH="$HOME/.local/bin:$PATH"
 source .venv/bin/activate
 module load Python/3.10.8-GCCcore-12.2.0
 
-FRACTIONS=(0.125 0.0625 0.03125 0.02 0.01)
+FRACTIONS=(0.125 0.5)
 export WANDB_API_KEY=6847fa93f84b5335cd0ba5f438e6ba60fbe5b76b
 
 MY_FRACTION=${FRACTIONS[$SLURM_ARRAY_TASK_ID]}

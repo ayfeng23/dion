@@ -2,7 +2,7 @@
 #SBATCH --job-name=normuon
 #SBATCH --output=logs/h200_normuon.out 
 #SBATCH --error=logs/h200_normuon.err
-#SBATCH --time=16:00:00
+#SBATCH --time=4:00:00
 #SBATCH --partition=gpu_h200
 #SBATCH --cpus-per-gpu=8
 #SBATCH --gpus=h200:1
@@ -13,6 +13,6 @@ module load Python/3.10.8-GCCcore-12.2.0
 
 export WANDB_API_KEY=6847fa93f84b5335cd0ba5f438e6ba60fbe5b76b
 
-CONFIG="configs/normuon_350m.yaml"
+CONFIG="configs/normuon_160m.yaml"
 
 torchrun --standalone --nproc_per_node=1 train.py --config $CONFIG
