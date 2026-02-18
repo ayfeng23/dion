@@ -694,7 +694,7 @@ def dion2_post_orthogonalize(
             interp = o_unsel_frob / u_unsel_frob
         else:
             o_unsel_frob = -1
-        interp = o_frob / u_subset_frob
+            interp = o_frob / u_subset_frob
         wandb.log({
             f"u_frob/{name}": u_frob.item(),
             f"o_full_frob/{name}": o_full_frob.item(),
