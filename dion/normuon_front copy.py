@@ -22,13 +22,14 @@ from .scalar_opts import adamw_update_foreach_async, lion_update_foreach_async
 from .muon import (
     muon_update_newton_schulz,
     muon_update_post_orthogonalize,
+    # muon_update_pre_orthogonalize,
     zeropower_via_newtonschulz5,
     adjust_lr_spectral_norm,
     adjust_lr_rms_norm,
 )
 
 
-class NorMuon(Optimizer):
+class NorMuonFront(Optimizer):
     """
     Distributed NorMuon optimizer for PyTorch FSDP2. Also compatible with DDP.
 
@@ -314,7 +315,7 @@ class NorMuon(Optimizer):
                         params, gradients, momentums, variances_neuron
                     ):
                         yield AsyncTask(
-                            normuon_update_batch_async(
+                            normuon_front_update_batch_async(
                                 X=[x],
                                 G=[g],
                                 M=[m],
@@ -326,7 +327,7 @@ class NorMuon(Optimizer):
                 # Otherwise, we parallelize the Muon update across devices
                 else:
                     yield AsyncTask(
-                        normuon_update_batch_async(
+                        normuon_front_update_batch_async(
                             X=pad_batch(params, self._world_size),
                             G=pad_batch(gradients, self._world_size),
                             M=pad_batch(momentums, self._world_size),
@@ -421,7 +422,7 @@ class NorMuon(Optimizer):
             )
 
 
-def normuon_update_batch_async(
+def normuon_front_update_batch_async(
     X: List[Tensor],  # Model weights (modified in place)
     G: List[Tensor],  # Gradient
     M: List[Tensor],  # Momentum buffer (modified in place)
@@ -451,31 +452,25 @@ def normuon_update_batch_async(
     assert len(X) == len(M)
 
     # Update momentum and compute the inputs for orthogonalization
-    U = muon_update_pre_orthogonalize(
+    # This does not include (1-\beta) for the gradient as in the Normuon paper
+    M_new = muon_update_pre_orthogonalize(
         G=to_local(G),
         M=to_local(M),
         momentum=momentum,
         nesterov=nesterov,
     )
 
-    U_stacked = torch.stack(U, dim=0)
-    slice_norms = U_stacked.norm(p=1, dim=norm_dim)
+    # Removed Newton Schuz Orthogonalization 
+    
+    # NorMuon Front normalization, removed the rescaling
+    U = list(normuon_front_second_moment(
+        G=to_local(G),
+        M_new=M_new,
+        V=to_local(V),
+        muon_beta2=muon_beta2,
+    ))
 
-    num_select = M[0].size(select_dim)
-    fraction=0.5 
-    k = max(1, int(math.ceil(fraction * num_select)))
-
-    _, indices = torch.topk(slice_norms, k, dim=-1, sorted=False)
-    num_cols = M[0].size(-1)
-    indices_expanded = indices.unsqueeze(-1).expand(-1, -1, num_cols)
-    selected_stacked = torch.gather(U_stacked, dim=-2, index=indices_expanded)
-    indices_list = list(indices.unbind(dim=0))
-    U_selected = list(selected_stacked.to(dtype=torch.bfloat16).unbind(dim=0))
-
-    for m, idx in zip(M, indices_list):
-        selected_slice = m.index_select(dim=select_dim, index=idx)
-        m.index_copy_(dim=select_dim, index=idx, source=selected_slice * ef_decay)
-
+    #Newton Schulz Update
     # Get one whole matrix for each device to orthogonalize
     if shard_dim is not None:
         # Use all-to-all to transform from a batch of shards to a single whole matrix
@@ -491,11 +486,11 @@ def normuon_update_batch_async(
         ), f"Shard dimension {shard_dim} size {X[0].size(shard_dim)} is not divisible by world size {world_size}."
 
         # Allocate buffers to receive shards of one whole matrix from other devices
-        single_matrix_shards = [torch.empty_like(u) for u in U_selected]
+        single_matrix_shards = [torch.empty_like(u) for u in U]
 
         # Redistribute the shards to form one unique full tensor on each device
         work = dist.all_to_all(
-            single_matrix_shards, U_selected, group=process_group, async_op=True
+            single_matrix_shards, U, group=process_group, async_op=True
         )
         yield
         work.wait()
@@ -517,9 +512,8 @@ def normuon_update_batch_async(
         ]
 
         # Redistribute the orthogonalized tensor back to original layout
-        O = [torch.empty_like(u) for u in U_selected]
         work = dist.all_to_all(
-            O, single_matrix_shards, group=process_group, async_op=True
+            U, single_matrix_shards, group=process_group, async_op=True
         )
         #
         yield
@@ -527,11 +521,11 @@ def normuon_update_batch_async(
 
     # Matrices are not sharded, so we can distribute the batch across different devices
     # Get a single matrix of the batch corresponding to this device
-    elif len(U_selected) > 1:
-        assert len(U_selected) == world_size, "Batch size must equal world size"
+    elif len(U) > 1:
+        assert len(U) == world_size, "Batch size must equal world size"
         assert process_group is not None
 
-        single_matrix = U_selected[device_rank]
+        single_matrix = U[device_rank]
         assert not isinstance(single_matrix, DTensor)
 
         single_matrix = muon_update_newton_schulz(
@@ -542,11 +536,13 @@ def normuon_update_batch_async(
         )
 
         # Allocate empty tensors to receive updates from other devices
-        O = [torch.empty_like(u) for u in U_selected]
+        # Modified to match dtype (all bfloat_16)
+        single_matrix = single_matrix.contiguous()
+        U = [torch.empty_like(single_matrix) for _ in range(world_size)]
 
         # All gather orthogonalized results from other devices into buffer
         work = dist.all_gather(
-            O, single_matrix.contiguous(), group=process_group, async_op=True
+            U, single_matrix, group=process_group, async_op=True
         )
         yield
         work.wait()
@@ -555,30 +551,14 @@ def normuon_update_batch_async(
     # - Running on a single GPU
     # - 3D+ tensors sharded along a batch dimension (different whole matrices per device)
     else:
-        assert len(U_selected) == 1
-        O = [
-                muon_update_newton_schulz(
-                U_selected[0],
-                newton_schulz_func=newton_schulz_func,
-                flatten=flatten,
-                epsilon=epsilon,
-            )
-        ]
+        assert len(U) == 1
 
-    #must do interp?, or just normuon normalize part of it?
-
-    O_full = []
-    for u_i, idx_i, o_i in zip(U, indices_list, O):
-        out_i = torch.zeros_like(u_i)                 # [R, C] (or same as u_i)
-        out_i.index_copy_(dim=select_dim, index=idx_i, source=o_i)
-        O_full.append(out_i)
-
-    # NorMuon normalization
-    U = normuon_normalization(
-        O_full,
-        V=to_local(V),
-        muon_beta2=muon_beta2,
-    )
+        U[0] = muon_update_newton_schulz(
+            U[0],
+            newton_schulz_func=newton_schulz_func,
+            flatten=flatten,
+            epsilon=epsilon,
+        )
 
     # Compute scaled learning rate
     # Do this before to_local(X) because we use the full tensor shape, not the shard shape
@@ -601,6 +581,38 @@ def normuon_update_batch_async(
         cautious_wd=cautious_wd,
     )
 
+
+@torch.compile(fullgraph=True)
+def normuon_front_second_moment(
+    G: List[Tensor],
+    M_new: List[Tensor],
+    V: List[Tensor],
+    muon_beta2: Tensor,
+) -> List[Tensor]:
+    """
+    NorMuon second moment step after orthogonalization.
+    Inputs and outputs should be lists of regular Tensor, not DTensor.
+    This is a separate function for compatibility with torch.compile().
+    """
+    V_dtype = V[0].dtype
+    M_new = [m_new.to(dtype=V_dtype) for m_new in M_new]
+    G_adj = [g.to(dtype=V_dtype) for g in G]
+
+    G_sq = torch._foreach_mul(G_adj, G_adj)  # list of g*g, same shapes as G_adj
+    neuron_norms = [g_sq.mean(dim=-1, keepdim=True) for g_sq in G_sq]  # Shape: [*, 1]
+    torch._foreach_lerp_(
+        V, neuron_norms, 1 - muon_beta2
+    )  # Update variance neuron buffer
+
+    denom = torch._foreach_sqrt(V)  # list of sqrt(v)
+    torch._foreach_add_(denom, 1e-8)  # denom[i] += 1e-8
+    normalized_U = torch._foreach_div(M_new, denom)  # list of u / denom
+    normalized_U = [u.to(dtype=torch.bfloat16) for u in normalized_U]
+    return normalized_U
+
+
+
+
 @torch.compile(fullgraph=True)
 def muon_update_pre_orthogonalize(
     G: List[Tensor],
@@ -617,9 +629,9 @@ def muon_update_pre_orthogonalize(
     G = [g.to(dtype=dtype) for g in G]
 
     # Update momentum with new gradient
+    torch._foreach_mul_(M, momentum)
     torch._foreach_add_(M, G)
 
-    assert nesterov == False
     if nesterov:
         U = torch._foreach_mul(M, momentum)
         torch._foreach_add_(U, G)
@@ -630,40 +642,3 @@ def muon_update_pre_orthogonalize(
     U = [u.to(dtype=torch.bfloat16) for u in U]
 
     return U
-
-@torch.compile(fullgraph=True)
-def normuon_normalization(
-    U: List[Tensor],
-    V: List[Tensor],
-    muon_beta2: Tensor,
-) -> List[Tensor]:
-    """
-    NorMuon normalization step after orthogonalization.
-    Inputs and outputs should be lists of regular Tensor, not DTensor.
-    This is a separate function for compatibility with torch.compile().
-    """
-    V_dtype = V[0].dtype
-    U = [u.to(dtype=V_dtype) for u in U]
-    norm_U = [
-        u.norm(p=2, dim=(-2, -1), keepdim=True) for u in U
-    ]  # list of ||u||_F, shape [*, 1, 1]
-
-    U_sq = torch._foreach_mul(U, U)  # list of u*u, same shapes as U
-    neuron_norms = [u_sq.mean(dim=-1, keepdim=True) for u_sq in U_sq]  # Shape: [*, 1]
-    torch._foreach_lerp_(
-        V, neuron_norms, 1 - muon_beta2
-    )  # Update variance neuron buffer
-
-    denom = torch._foreach_sqrt(V)  # list of sqrt(v)
-    torch._foreach_add_(denom, 1e-8)  # denom[i] += 1e-8
-    normalized_U = torch._foreach_div(U, denom)  # list of u / denom
-
-    norm_U_new = [
-        nu.norm(p=2, dim=(-2, -1), keepdim=True) for nu in normalized_U
-    ]  # list of ||normalized_u||_F, shape [*, 1, 1]
-    ratio = torch._foreach_div(
-        norm_U, norm_U_new
-    )  # list of ||u||_F / ||normalized_u||_F, shape [*, 1, 1]
-    torch._foreach_mul_(normalized_U, ratio)  # normalized_u[i] *= ratio
-
-    return normalized_U

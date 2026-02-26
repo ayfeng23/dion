@@ -1058,6 +1058,7 @@ def main():
                     x_label=f"rank_{dist.get_rank()}",
                 ),
             )
+            run.log_code(".")
             checkpoint_manager.wandb_id = run.id
 
         # Broadcast wandb_id to all processes

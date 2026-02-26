@@ -3,7 +3,7 @@
 #SBATCH --output=logs/h200_normuon.out 
 #SBATCH --error=logs/h200_normuon.err
 #SBATCH --time=4:00:00
-#SBATCH --partition=gpu_h200
+#SBATCH --partition=gpu_devel
 #SBATCH --cpus-per-gpu=8
 #SBATCH --gpus=h200:1
 #SBATCH --mem=64G

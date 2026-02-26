@@ -459,6 +459,10 @@ def fracnormuon_update_batch_async(
         ef_decay=ef_decay,
     )
 
+    for m, idx in zip(M, indices_list):
+        selected_slice = m.index_select(dim=select_dim, index=idx)
+        m.index_copy_(dim=select_dim, index=idx, source=selected_slice * ef_decay)
+
     # Austin: error feedback only updated params
     # torch._foreach_mul_(M, ef_decay)
     # if interp == 0:
@@ -614,7 +618,7 @@ def fracnormuon_pre_orthogonalize(
     # Update momentum: M = M + G
     G = [g.to(dtype=dtype) for g in G]
 
-    torch._foreach_mul_(M, ef_decay)
+    # torch._foreach_mul_(M, ef_decay)
 
     torch._foreach_add_(M, G)
 
@@ -695,17 +699,17 @@ def dion2_post_orthogonalize(
         else:
             o_unsel_frob = -1
             interp = o_frob / u_subset_frob
-        wandb.log({
-            f"u_frob/{name}": u_frob.item(),
-            f"o_full_frob/{name}": o_full_frob.item(),
-            f"o_frob/{name}": o_frob.item(),
-            f"u_subset_frob/{name}": u_subset_frob.item(),
-            f"u_unsel_frob/{name}": u_unsel_frob, 
-            f"o_unsel_frob/{name}": o_unsel_frob, 
-            f"o_frob_norm/{name}": o_frob_per_elem.item(),
-            f"u_frob_norm/{name}": u_frob_per_elem.item()
-        }, commit=False)
-        
+        # wandb.log({
+        #     f"u_frob/{name}": u_frob.item(),
+        #     f"o_full_frob/{name}": o_full_frob.item(),
+        #     f"o_frob/{name}": o_frob.item(),
+        #     f"u_subset_frob/{name}": u_subset_frob.item(),
+        #     f"u_unsel_frob/{name}": u_unsel_frob, 
+        #     f"o_unsel_frob/{name}": o_unsel_frob, 
+        #     f"o_frob_norm/{name}": o_frob_per_elem.item(),
+        #     f"u_frob_norm/{name}": u_frob_per_elem.item()
+        # }, commit=False)
+        interp = 0
         # interp = o_frob / u_subset_frob
         # o_frob / u_subset_frob << 1. 
         # o_subset_rms / (complement of u_subset)_rms > 1
@@ -718,7 +722,7 @@ def dion2_post_orthogonalize(
         # Austin: first do weight decay and then updates
         # split weight_decay based on learning rates
         x_sel = x.index_select(select_dim, idx)
-        x.mul_(1 - base_lr * weight_decay)
+        x.mul_(1 - base_lr * weight_decay) #rescale weight decay?
         x_sel.mul_(1 - full_lr * weight_decay) #full_lr to avoid warmup issues
         x.index_copy_(select_dim, idx, x_sel)
 
