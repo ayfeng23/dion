@@ -68,6 +68,7 @@ class Hyperparameters:
     # Main optimizer hyperparameters
     lr: float = 0.02
     mu: float = 0.95
+    ef_subset: float = 0.95
     momentum: float = 0.95
     weight_decay: float = 0.01
     ortho_fraction: float = 0.25
@@ -588,6 +589,7 @@ def init_optimizer(
             lr=hp.lr,
             fraction=hp.ortho_fraction,
             ef_decay=hp.mu,
+            ef_decay_subset=hp.ef_subset,
             muon_beta2=0.95,
             weight_decay=hp.weight_decay,
             partial_warmup=hp.partial_warmup,

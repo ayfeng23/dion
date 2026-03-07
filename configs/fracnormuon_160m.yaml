@@ -11,11 +11,12 @@ device_batch_size: 32
 num_iterations: 6000
 
 # — Learning‐rate schedule —
-warmup_ratio: 0.0
+warmup_ratio: 0.05
 warmdown_ratio: 0.2
 
 # — Optimizer & Hyperparameters —
 mu: 0.95
+ef_subset: 0.95
 weight_decay: 0.01
 
 # — Validation & Checkpointing —
