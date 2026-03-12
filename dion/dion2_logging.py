@@ -7,8 +7,6 @@ from torch.distributed import ProcessGroup
 from torch.distributed.tensor import DeviceMesh, DTensor
 from torch.optim.optimizer import Optimizer, ParamsT
 from typing import Callable, Generator, List, Optional, Tuple, Union
-from .muon import muon_update_pre_orthogonalize
-from .normuon_front import normuon_front_second_moment
 import wandb
 
 from .newton_schulz_triton import newton_schulz_triton, zeropower_via_newtonschulz5
@@ -28,11 +26,39 @@ from .muon import (
     muon_update_newton_schulz,
     adjust_lr_spectral_norm,
     adjust_lr_rms_norm,
-    muon_update_post_orthogonalize,
 )
 
 
-class FracNormuon(Optimizer):
+class Dion2(Optimizer):
+    """
+    Distributed Dion2 optimizer for PyTorch FSDP2. Also compatible with DDP.
+
+    Args:
+        params: Parameters for the optimizer.
+        distributed_mesh: DeviceMesh or ProcessGroup for distributed training.
+            Use DeviceMesh for FSDP2 and ProcessGroup for DistributedDataParallel.
+        lr: Base learning rate. For Muon, this will be scaled based on the matrix dimensions.
+            For element-wise update rules, this is the actual learning rate and no additional scaling is done.
+        fraction: Fraction of submatrix to orthogonalize per update (0 < fraction <= 1).
+        ef_decay: Error-feedback decay factor applied to selected submatrix.
+        betas: Tuple of (beta1, beta2) for AdamW and Lion algorithms.
+        weight_decay: Weight decay factor.
+        epsilon: Small value to avoid division by zero.
+        adjust_lr: How to adjust the learning rate for Muon updates ("spectral_norm" or "rms_norm" or None).
+            "spectral_norm": Adjust based on spectral norm, for learning rate transfer across model scale.
+            "rms_norm": Adjust based on RMS norm, for learning rate compatibility with Adam/AdamW.
+            None: Do not adjust the learning rate.
+        flatten: Whether to flatten 3D+ tensors to 2D for Muon updates.
+            True: Tensors with 3+ dimensions are flattened to 2D. Use this for convolutional layers.
+            False: Tensors are not flattened. 3D+ tensors are treated as batches of 2D matrices.
+        use_triton: Whether to use Triton kernel for Newton-Schulz. Ignored if custom function is provided.
+        newton_schulz_func: Use a custom Newton-Schulz function for orthogonalization.
+            Signature is `func(input: Tensor, epsilon: float) -> Tensor`.
+        verbose: Whether to print debug information during updates. If True, it prints whether rows or columns are selected for the submatrix selection process.
+
+    Dion2 optimizer by Ahn et al.: TBD
+    """
+
     def __init__(
         self,
         params: ParamsT,
@@ -40,22 +66,14 @@ class FracNormuon(Optimizer):
         lr: float = 0.01,
         fraction: float = 0.25,
         ef_decay: float = 0.95,
-        ef_decay_subset: float = 0.95,
-        muon_beta2: float = 0.95,
         betas: Tuple[float, float] = (0.9, 0.95),
         weight_decay: float = 0.01,
         epsilon: float = 1e-8,
-        interp: float = 1.0,
-        ef_partial: bool = True,
         adjust_lr: Optional[str] = "spectral_norm",
         flatten: bool = False,
         use_triton: bool = False,
         newton_schulz_func: Optional[Callable] = None,
         verbose: bool = False,
-        # Austin: partial_warmup determines whether to use warmup on all updates (False) or orthonormalized ones (True)
-        partial_warmup: bool = True, 
-        # Austin: warmup_cutoff is an auxiliary variable to ensure partial_warmup logic only affects warmup (and not warmdown crucially)
-        warmup_cutoff: int = 0, 
     ):
         # Validate hyperparameters
         if lr < 0.0:
@@ -74,23 +92,15 @@ class FracNormuon(Optimizer):
         defaults = dict(
             lr=lr,
             ef_decay=ef_decay,
-            ef_decay_subset=ef_decay_subset,
-            muon_beta2=muon_beta2,
             fraction=fraction,
             beta1=betas[0],
             beta2=betas[1],
             weight_decay=weight_decay,
             epsilon=epsilon,
             flatten=flatten,
-            interp=interp,
-            ef_partial=ef_partial,
             adjust_lr=adjust_lr,
-            algorithm="fracnormuon",
-            # Austin: step needed to see if we reach warmup_cutoff
+            algorithm="dion2",
             step=0,
-            warmup_cutoff=warmup_cutoff,
-            # Austin: store warmup-non-adjusted learning rate
-            full_lr=torch.tensor(lr) if partial_warmup else None,
         )
         super().__init__(params, defaults)
 
@@ -140,7 +150,7 @@ class FracNormuon(Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
-        fracnormuon_groups = []
+        dion2_groups = []
         lion_groups = []
         adamw_groups = []
 
@@ -150,8 +160,8 @@ class FracNormuon(Optimizer):
 
             # Split parameter groups by algorithm
             algo = group["algorithm"]
-            if algo == "fracnormuon":
-                fracnormuon_groups.append(group)
+            if algo == "dion2":
+                dion2_groups.append(group)
             elif algo == "lion":
                 lion_groups.append(group)
             elif algo == "adamw":
@@ -160,11 +170,11 @@ class FracNormuon(Optimizer):
                 raise ValueError(f"Unknown algorithm: {algo}")
 
         # Create async tasks for each algorithm
-        fracnormuon_tasks = self._create_fracnormuon_tasks(fracnormuon_groups, verbose=self.verbose)
+        dion2_tasks = self._create_dion2_tasks(dion2_groups, verbose=self.verbose)
         lion_tasks = self._create_lion_tasks(lion_groups)
         adamw_tasks = self._create_adamw_tasks(adamw_groups)
 
-        all_tasks = chain(fracnormuon_tasks, lion_tasks, adamw_tasks)
+        all_tasks = chain(dion2_tasks, lion_tasks, adamw_tasks)
         runtime = AsyncRuntime(all_tasks, max_concurrent_tasks=3)
         runtime.run()
 
@@ -180,24 +190,22 @@ class FracNormuon(Optimizer):
             state["momentum"] = torch.zeros_like(param)
             if algo == "adamw":
                 state["variance"] = torch.zeros_like(param)
-            if algo == "fracnormuon":
-                state["variance_neuron"] = torch.zeros_like(param[..., 0:1])
         return state
 
-    def _create_fracnormuon_tasks(
+    def _create_dion2_tasks(
         self,
         param_groups: List[dict],
         verbose: bool = False,
     ) -> Generator["AsyncTask", None, None]:
         """
-        Helper function to create batches of FracNormuon matrices and generate
+        Helper function to create batches of Dion2 matrices and generate
         AsyncTask objects so we can process multiple batches concurrently.
         """
         for group in param_groups:
-            assert group["algorithm"] == "fracnormuon"
+            assert group["algorithm"] == "dion2"
             assert all(
                 p.ndim >= 2 for p in group["params"]
-            ), "Fracnormuon only supports matrix parameters."
+            ), "Dion2 only supports matrix parameters."
 
             if "param_names" in group:
                 group_items = [
@@ -208,28 +216,20 @@ class FracNormuon(Optimizer):
             else:
                 group_items = [(p, "<unnamed>") for p in group["params"] if p.grad is not None]
 
-            # group_params = [p for p in group["params"] if p.grad is not None]
             if not group_items:
                 continue
 
             # Most hyperparameters as tensors for torch.compile
             # Here "fraction" only determines the dimension of the submatrix
             # to be orthonormalized. Hence, it doesn't need to be a tensor
-            fracnormuon_args = dict(
+            dion2_args = dict(
                 lr=torch.tensor(group["lr"]),
                 ef_decay=torch.tensor(group["ef_decay"]),
-                ef_decay_subset=torch.tensor(group["ef_decay_subset"]),
                 fraction=group["fraction"],
-                muon_beta2=torch.tensor(group["muon_beta2"]),
                 weight_decay=torch.tensor(group["weight_decay"]),
                 epsilon=torch.tensor(group["epsilon"]),
-                interp=group["interp"],
-                ef_partial=group["ef_partial"],
                 flatten=group["flatten"],
                 adjust_lr=group["adjust_lr"],
-                full_lr=group["full_lr"],
-                warmup_cutoff=group["warmup_cutoff"],
-                step=group["step"],
                 device_rank=self._device_rank,
                 world_size=self._world_size,
                 process_group=self._process_group,
@@ -241,9 +241,8 @@ class FracNormuon(Optimizer):
                 params = [p for p, _ in batch]
                 names  = [n for _, n in batch]
                 gradients = [p.grad for p in params]
-                states = [self._get_or_initialize_state(p, "fracnormuon") for p in params]
+                states = [self._get_or_initialize_state(p, "dion2") for p in params]
                 momentums = [s["momentum"] for s in states]
-                variances = [s["variance_neuron"] for s in states]
 
                 # Get sharding state for DTensor
                 is_batch_sharded = False
@@ -285,7 +284,7 @@ class FracNormuon(Optimizer):
                         sharded_tensor_dim = shard_placements[0][1].dim
                     elif len(shard_placements) > 1:
                         raise NotImplementedError(
-                            "Fracnormuon does not support parameters with multiple sharded dimensions."
+                            "Dion2 does not support parameters with multiple sharded dimensions."
                         )
 
                     # Check that the sharded mesh dimension matches optimizer's device mesh
@@ -303,30 +302,28 @@ class FracNormuon(Optimizer):
                 # As long as matrix dimensions are not sharded, each device will have whole matrices
                 # Each device already has different matrices of the batch, so we can't parallelize further
                 if is_batch_sharded and not is_matrix_sharded:
-                    for x, g, m, v in zip(params, gradients, momentums, variances):
+                    for x, g, m in zip(params, gradients, momentums):
                         yield AsyncTask(
-                            fracnormuon_update_batch_async(
+                            dion2_update_batch_async(
                                 X=[x],
                                 G=[g],
                                 M=[m],
                                 names=[n],
-                                V=[v],
                                 shard_dim=None,  # No sharded matrix dim
-                                **fracnormuon_args,
+                                **dion2_args,
                                 verbose=verbose,
                             )
                         )
                 # Otherwise, we parallelize the Muon update across devices
                 else:
                     yield AsyncTask(
-                        fracnormuon_update_batch_async(
+                        dion2_update_batch_async(
                             X=pad_batch(params, self._world_size),
                             G=pad_batch(gradients, self._world_size),
                             M=pad_batch(momentums, self._world_size),
                             names=pad_names(names, self._world_size),
-                            V=pad_batch(variances, self._world_size),
                             shard_dim=sharded_tensor_dim,
-                            **fracnormuon_args,
+                            **dion2_args,
                             verbose=verbose,
                         )
                     )
@@ -412,35 +409,27 @@ class FracNormuon(Optimizer):
             )
 
 
-def fracnormuon_update_batch_async(
+def dion2_update_batch_async(
     X: List[Tensor],  # Model weights (modified in place)
     G: List[Tensor],  # Gradient
     M: List[Tensor],  # Momentum buffer (modified in place)
     names: List[str], # Name of Tensor parameters
-    V: List[Tensor],
     lr: Tensor,  # Learning rate (scalar tensor)
-    muon_beta2: Tensor,
     ef_decay: Tensor,  # Error-feedback factor (scalar tensor)
-    ef_decay_subset: Tensor,
     fraction: float,  # Fraction of submatrix to orthogonalize (0 < fraction <= 1)
     weight_decay: Tensor,  # Weight decay (scalar tensor)
     epsilon: Tensor,  # Epsilon (scalar tensor)
-    interp: float,
-    ef_partial: bool,
     flatten: bool,  # Whether to flatten 3D+ tensors to 2D
     adjust_lr: Optional[str],  # How to adjust learning rate
     device_rank: int,  # Rank of the current device
     world_size: int,  # Total number of devices to parallelize over
-    step: int,
     shard_dim: Optional[int] = None,  # Shard dimension for DTensor (if applicable)
     process_group: Optional[ProcessGroup] = None,
     newton_schulz_func: Optional[Callable] = None,
     verbose: bool = False,
-    full_lr: Optional[Tensor] = None, 
-    warmup_cutoff: int = 0,
 ) -> Generator[None, None, None]:
     """
-    Batched version of FracNormuon update. Batch size should be equal to number of GPUs.
+    Batched version of Dion2 update. Batch size should be equal to number of GPUs.
     All tensors in a batch should have identical shape, sharding, and dtype.
     Identical hyperparameters are used for all tensors in the batch.
     """
@@ -451,25 +440,37 @@ def fracnormuon_update_batch_async(
     # For sharded matrices, we align select_dim with shard_dim
     # For unsharded matrices (DDP or single-GPU), we select the shorter dimension
     ndim = X[0].ndim
-    select_dim = -2
+    select_dim = None
 
-    U, U_selected, indices_list = fracnormuon_pre_orthogonalize(
+    if shard_dim is not None:
+        # Normalize shard_dim to negative indexing for unified treatment
+        shard_dim = shard_dim if shard_dim < 0 else shard_dim - ndim
+        if shard_dim == -2:
+            select_dim = -2  # Row-sharded
+        elif shard_dim == -1:
+            select_dim = -1  # Column-sharded
+
+    # Fall-back to shorter dimension when DDP, Single-GPU, or batch-sharded
+    if select_dim is None:
+        num_rows, num_cols = X[0].shape[-2:]
+        select_dim = -2 if num_rows <= num_cols else -1
+
+    # Print how the selection choice based on shard_dim and tensor shape
+    if verbose:
+        _print_selection_choice(X[0].shape, shard_dim, select_dim, ndim)
+
+    # Update momentum and select top-α fraction along select_dim
+    U_selected, indices_list = dion2_pre_orthogonalize(
         G=to_local(G),
         M=to_local(M),
-        V=to_local(V),
         fraction=fraction,
-        select_dim=select_dim,
-        muon_beta2=muon_beta2,
         ef_decay=ef_decay,
-        ef_decay_subset=ef_decay_subset
+        select_dim=select_dim,
     )
-
-    # Austin: error feedback only updated params
-    for m, idx in zip(M, indices_list):
-        selected_slice = m.index_select(dim=select_dim, index=idx)
-        m.index_copy_(dim=select_dim, index=idx, source=selected_slice * ef_decay_subset)
-    # torch._foreach_mul_(M, ef_decay_subset)
-    # torch._foreach_mul_(M, ef_decay)
+    for name, idx in zip(names, indices_list):
+        wandb.log({
+            f"ortho_sel_k/{name}": idx.tolist(),
+        }, commit=False)
 
     # Get one whole matrix for each device to orthogonalize
     if shard_dim is not None:
@@ -507,8 +508,8 @@ def fracnormuon_update_batch_async(
         ]
 
         # Redistribute the orthogonalized tensor back to original layout
-        O = [torch.empty_like(u) for u in U_selected]
-        work = dist.all_to_all(O, send_shards, group=process_group, async_op=True)
+        U_ortho = [torch.empty_like(u) for u in U_selected]
+        work = dist.all_to_all(U_ortho, send_shards, group=process_group, async_op=True)
         yield
         work.wait()
 
@@ -529,10 +530,10 @@ def fracnormuon_update_batch_async(
         )
 
         # Allocate empty tensors to receive updates from other devices
-        O = [torch.empty_like(u) for u in U_selected]
+        U_ortho = [torch.empty_like(u) for u in U_selected]
         # All gather orthogonalized results from other devices into buffer
         work = dist.all_gather(
-            O, single_ortho.contiguous(), group=process_group, async_op=True
+            U_ortho, single_ortho.contiguous(), group=process_group, async_op=True
         )
         yield
         work.wait()
@@ -542,7 +543,7 @@ def fracnormuon_update_batch_async(
     # - 3D+ tensors sharded along a batch dimension (different whole matrices per device)
     else:
         assert len(U_selected) == 1
-        O = [
+        U_ortho = [
             muon_update_newton_schulz(
                 U_selected[0], newton_schulz_func, flatten=flatten, epsilon=epsilon
             )
@@ -552,57 +553,41 @@ def fracnormuon_update_batch_async(
     # Do this before to_local(X) because we use the full tensor shape, not the shard shape
     if adjust_lr is None:
         adjusted_lr = lr
-        adjusted_full_lr = full_lr if full_lr is not None else None
     elif adjust_lr == "spectral_norm":
         adjusted_lr = adjust_lr_spectral_norm(lr, X[0].shape, flatten=flatten)
-        adjusted_full_lr = adjust_lr_spectral_norm(full_lr, X[0].shape, flatten=flatten) if full_lr is not None else None
     elif adjust_lr == "rms_norm":
         adjusted_lr = adjust_lr_rms_norm(lr, X[0].shape, flatten=flatten)
-        adjusted_full_lr = adjust_lr_rms_norm(full_lr, X[0].shape, flatten=flatten) if full_lr is not None else None
     else:
         raise ValueError(f"Unknown adjust_lr: {adjust_lr}")
 
+    # Update model parameters with orthogonalized output
+    # Weight update is applied to selected slices only
     dion2_post_orthogonalize(
         X=to_local(X),
-        O=O,
-        U=U, 
+        U=U_ortho,
         indices=indices_list,
         base_lr=lr,
         adjusted_lr=adjusted_lr,
         weight_decay=weight_decay,
         select_dim=select_dim,
-        interp=interp,
-        full_lr=full_lr,
-        adjusted_full_lr=adjusted_full_lr,
-        # Austin: full_lr is not None occurs only when we use partial_warmup for the run, step < warmup_cutoff so that orthonormalized parts can warm down
-        partial_warmup=(full_lr is not None) and (step < warmup_cutoff),
-        process_group=process_group,
-        device_rank=device_rank,
-        names=names,
-        newton_schulz_func=newton_schulz_func,
-        flatten=flatten,
-        epsilon=epsilon,
     )
 
 
 @torch.compile(fullgraph=True)
-def fracnormuon_pre_orthogonalize(
+def dion2_pre_orthogonalize(
     G: List[Tensor],
     M: List[Tensor],
-    V: List[Tensor],
-    fraction: float,
+    fraction: Tensor,
+    ef_decay: Tensor,
     select_dim: int,
-    muon_beta2: Tensor,
-    ef_decay: float,
-    ef_decay_subset: float,
-) -> Tuple[List[Tensor], List[Tensor], List[Tensor]]:
+) -> Tuple[List[Tensor], List[Tensor]]:
     """
     Update momentum with gradient and compute the input to orthogonalization.
     More specifically, it does the following steps:
         - updates the momentum with gradient
         - computes the top-k indices (according to L1 norm) to determine submatrices
         - (other norms can be used such as L2 norm)
-        - We move error feedback out for more flexibility
+        - does in-place error-feedback decay on the selected submatrices
         - output submatrices and indices
     Inputs and outputs should be lists of regular Tensor, not DTensor.
     This is a separate function for compatibility with torch.compile().
@@ -612,117 +597,71 @@ def fracnormuon_pre_orthogonalize(
     # norm_dim is the dimension we compute norm over
     # select_dim is the dimension we select submatrix from
     num_select = M[0].size(select_dim)
-    norm_dim = -1  
+    norm_dim = -1 if select_dim == -2 else -2
     k = max(1, int(math.ceil(fraction * num_select)))
 
     # Update momentum: M = M + G
     G = [g.to(dtype=dtype) for g in G]
-
-    torch._foreach_mul_(M, ef_decay)
-
     torch._foreach_add_(M, G)
 
-    #Non-distributed / no-communication for row-sharding
-    U = normuon_front_second_moment(G, M, V, muon_beta2)
-
-    U_stacked = torch.stack(U, dim=0)
-    # Compute L1 norm along norm_dim (sum of absolute values)
-    slice_norms = U_stacked.norm(p=1, dim=norm_dim)
-
     M_stacked = torch.stack(M, dim=0)
+
+    # Compute L1 norm along norm_dim (sum of absolute values)
     slice_norms = M_stacked.norm(p=1, dim=norm_dim)
 
     # Batched topk: indices shape (batch_size, k)
     _, indices = torch.topk(slice_norms, k, dim=-1, sorted=False)
 
-    # batch_size = U_stacked.size(0)
-    # rand_scores = torch.rand(batch_size, num_select, device=U_stacked.device)
-    # _, indices = torch.topk(rand_scores, k, dim=-1, sorted=False)
-    
-    # Always row-wise selection
-    num_cols = M[0].size(-1)
-    indices_expanded = indices.unsqueeze(-1).expand(-1, -1, num_cols)
-    selected_stacked = torch.gather(U_stacked, dim=-2, index=indices_expanded)
+    # Batched gather for slice extraction
+    if select_dim == -2:
+        # Selecting rows
+        num_cols = M[0].size(-1)
+        indices_expanded = indices.unsqueeze(-1).expand(-1, -1, num_cols)
+        selected_stacked = torch.gather(M_stacked, dim=-2, index=indices_expanded)
+    else:
+        # Selecting cols
+        num_rows = M[0].size(-2)
+        indices_expanded = indices.unsqueeze(-2).expand(-1, num_rows, -1)
+        selected_stacked = torch.gather(M_stacked, dim=-1, index=indices_expanded)
 
+    # Apply error feedback decay to selected slices in original M tensors
     indices_list = list(indices.unbind(dim=0))
-    
+    for m, idx in zip(M, indices_list):
+        selected_slice = m.index_select(dim=select_dim, index=idx)
+        m.index_copy_(dim=select_dim, index=idx, source=selected_slice * ef_decay)
+
     # Convert to bf16 and unstack for communication
     U_selected = list(selected_stacked.to(dtype=torch.bfloat16).unbind(dim=0))
 
-    return [u.clone() for u in U], U_selected, indices_list
+    return U_selected, indices_list
 
-# @torch.compile(fullgraph=True)
+
+@torch.compile(fullgraph=True)
 def dion2_post_orthogonalize(
     X: List[Tensor],
-    O: List[Tensor],
     U: List[Tensor],
     indices: List[Tensor],
     base_lr: Tensor,
     adjusted_lr: Tensor,
     weight_decay: Tensor,
     select_dim: int,
-    interp: float,
-    full_lr: Optional[Tensor],
-    adjusted_full_lr: Optional[Tensor],
-    partial_warmup: bool,
-    process_group: Optional[ProcessGroup],
-    device_rank: int,
-    names: List[str],
-    newton_schulz_func: Optional[Callable] = None,
-    flatten: bool = False,
-    epsilon: float = 1e-8,
 ):
+    """
+    Apply weight decay and weight update after orthogonalization.
+    Inputs and outputs should be lists of regular Tensor, not DTensor.
+    This is a separate function for compatibility with torch.compile().
+    """
+    torch._foreach_mul_(X, 1 - base_lr * weight_decay)
+
+    # Convert U to match parameter dtype
     dtype = X[0].dtype
-    # assert len(X) == 1
-    O = [o.to(dtype=dtype) for o in O]
     U = [u.to(dtype=dtype) for u in U]
-    if not partial_warmup: #default to full updates (mostly for warmdown)
-        full_lr = base_lr
-        adjusted_full_lr = adjusted_lr
+    # Apply weight update
+    neg_lr = -adjusted_lr
+    U_scaled = [neg_lr * u for u in U]
+    for x, u_scaled, idx in zip(X, U_scaled, indices):
+        x.index_add_(dim=select_dim, index=idx, source=u_scaled)
 
-    for x, o, u, name, idx in zip(X, O, U, names, indices):
-        # Austin: O is NS(U) and U=Adam-Normalized(M)
-        # u_subset is the "replaced" part of U
-        o_frob = o.norm(p="fro")
-        o_frob_per_elem = o_frob / math.sqrt(o.numel())
-        u_frob = u.norm(p="fro")
-        u_subset = u.index_select(select_dim, idx)
-        u_subset_frob = u_subset.norm(p="fro")
-        u_frob_per_elem = u.norm(p="fro") / math.sqrt(x.numel())
-        o_full = muon_update_newton_schulz(
-                    u, newton_schulz_func, flatten=flatten, epsilon=epsilon
-                )
-        o_full_frob = o_full.norm(p="fro")
-        o_full_frob_per_elem = o_full_frob / math.sqrt(o_full.numel())
-
-        # if process_group is None or device_rank == 0: 
-            # Austin: under DDP, I assume this gets the "whole batch", because you accum gradient anyway?
-            # And you don't need to shard params?
-        interp = o_frob / u_subset_frob
-        wandb.log({
-            f"ortho_sel_k/{name}": idx.tolist(),
-            # f"u_frob/{name}": u_frob.item(),
-            # f"o_full_frob/{name}": o_full_frob.item(),
-            # f"o_frob/{name}": o_frob.item(),
-            # f"u_subset_frob/{name}": u_subset_frob.item(),
-            # f"u_unsel_frob/{name}": u_unsel_frob, 
-            # f"o_unsel_frob/{name}": o_unsel_frob, 
-            # f"o_frob_norm/{name}": o_frob_per_elem.item(),
-            # f"u_frob_norm/{name}": u_frob_per_elem.item()
-        }, commit=False)
-
-        # Austin: first do weight decay and then updates
-        # split weight_decay based on learning rates
-        x_sel = x.index_select(select_dim, idx)
-        x.mul_(1 - base_lr * weight_decay) #rescale weight decay?
-        x_sel.mul_(1 - full_lr * weight_decay) #full_lr to avoid warmup issues
-        x.index_copy_(select_dim, idx, x_sel)
-
-        x_sel = x.index_select(select_dim, idx) 
-        x.sub_((u * interp) * adjusted_lr)
-        x_sel.sub_(o * adjusted_full_lr)  
-        x.index_copy_(select_dim, idx, x_sel)
- 
 
 # A helper function to print selection chocie for each matrix
 # It only prints once `verbose` is set True
@@ -762,6 +701,6 @@ def _print_selection_choice(
                 reason = f"shard_dim={shard_dim} (batch), shorter = {shorter}"
 
         print(
-            f"[FracNormuon] Shape {tuple(shape)}: {mode}, {reason} → "
+            f"[Dion2] Shape {tuple(shape)}: {mode}, {reason} → "
             f"select top-α {select_info} by {norm_info}"
         )

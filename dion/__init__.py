@@ -4,7 +4,7 @@ from .dion_simple import Dion as DionSimple
 from .dion_reference import Dion as DionReference
 from .muon import Muon
 from .muon_reference import Muon as MuonReference
-from .dion2 import Dion2
+from .dion2_logging import Dion2
 from .normuon import NorMuon
 from .normuon_front import NorMuonFront
 from .normuon_front_zichong import NorMuonFrontZC
