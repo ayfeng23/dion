@@ -2,6 +2,7 @@ data/
 pylog124M/
 __pycache__/
 logs/
+logs_sweep/
 venv/
 wandb/ 
 output/ 

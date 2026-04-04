@@ -1012,6 +1012,10 @@ def main():
         grad_norm = torch.nn.utils.get_total_norm(
             [p.grad for p in model.parameters() if p.grad is not None]
         )
+        # Parameter norm
+        param_norm = torch.nn.utils.get_total_norm(
+            [p for p in model.parameters()]
+        )
         optimizer.step()
         lr_scheduler.step()
         model.zero_grad(set_to_none=True)
@@ -1024,10 +1028,13 @@ def main():
 
         # Snapshot wall-clock training time for logging (without pausing t0)
         current_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
+        current_lr = optimizer.param_groups[0]["lr"]
         if MASTER_PROCESS and not cli_args.no_wandb and not cli_args.debug:
             log_dict = {
                 "train/loss": train_loss.item(),
                 "train/grad_norm": grad_norm.item(),
+                "train/param_norm": param_norm.item(),
+                "train/lr": current_lr,
                 "step": step,
                 "time/training_time_ms": current_training_time_ms,
             }
@@ -1037,7 +1044,7 @@ def main():
             wandb.log(log_dict)
         if MASTER_PROCESS and cli_args.debug:
             print0(
-                f"Step {step}: train_loss={train_loss.item():.4f}, grad_norm={grad_norm.item():.4f}"
+                f"Step {step}: train_loss={train_loss.item():.4f}, grad_norm={grad_norm.item():.4f}, param_norm={param_norm.item():.4f}, lr={current_lr:.6f}"
             )
         pbar.update(1)
         pbar.set_postfix(train_loss=f"{train_loss.item():.4f}")
