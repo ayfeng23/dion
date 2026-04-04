@@ -8,7 +8,7 @@ from torch.distributed.tensor import DeviceMesh, DTensor
 from torch.optim.optimizer import Optimizer, ParamsT
 from typing import Callable, Generator, List, Optional, Tuple, Union
 
-from .newton_schulz_triton import newton_schulz_triton, zeropower_via_newtonschulz5
+from .newton_schulz_triton import newton_schulz_triton
 from .opt_utils import (
     AsyncRuntime,
     AsyncTask,
@@ -21,26 +21,30 @@ from .scalar_opts import adamw_update_foreach_async, lion_update_foreach_async
 # Reuse Muon's helper functions
 from .muon import (
     muon_update_newton_schulz,
+    muon_update_post_orthogonalize,
+    zeropower_via_newtonschulz5,
     adjust_lr_spectral_norm,
     adjust_lr_rms_norm,
 )
 
 
-class Dion2(Optimizer):
+class NorDion2(Optimizer):
     """
-    Distributed Dion2 optimizer for PyTorch FSDP2. Also compatible with DDP.
+    Distributed NorDion2 optimizer for PyTorch FSDP2. Also compatible with DDP.
 
     Args:
         params: Parameters for the optimizer.
         distributed_mesh: DeviceMesh or ProcessGroup for distributed training.
             Use DeviceMesh for FSDP2 and ProcessGroup for DistributedDataParallel.
-        lr: Base learning rate. For Muon, this will be scaled based on the matrix dimensions.
+        lr: Base learning rate. For NorDion2, this will be scaled based on the matrix dimensions.
             For element-wise update rules, this is the actual learning rate and no additional scaling is done.
-        fraction: Fraction of submatrix to orthogonalize per update (0 < fraction <= 1).
-        ef_decay: Error-feedback decay factor applied to selected submatrix.
+        mu: Momentum factor for NorDion2 algorithm.
+        muon_beta2: Second beta parameter for NorDion2 algorithm's adaptive updates.
         betas: Tuple of (beta1, beta2) for AdamW and Lion algorithms.
         weight_decay: Weight decay factor.
+        cautious_wd: Whether to apply weight decay only where update and parameter signs align.
         epsilon: Small value to avoid division by zero.
+        nesterov: Whether to use Nesterov momentum.
         adjust_lr: How to adjust the learning rate for Muon updates ("spectral_norm" or "rms_norm" or None).
             "spectral_norm": Adjust based on spectral norm, for learning rate transfer across model scale.
             "rms_norm": Adjust based on RMS norm, for learning rate compatibility with Adam/AdamW.
@@ -51,9 +55,10 @@ class Dion2(Optimizer):
         use_triton: Whether to use Triton kernel for Newton-Schulz. Ignored if custom function is provided.
         newton_schulz_func: Use a custom Newton-Schulz function for orthogonalization.
             Signature is `func(input: Tensor, epsilon: float) -> Tensor`.
-        verbose: Whether to print debug information during updates. If True, it prints whether rows or columns are selected for the submatrix selection process.
 
-    Dion2 optimizer by Ahn et al.: TBD
+    Muon optimizer algorithm by Keller Jordan: https://kellerjordan.github.io/posts/muon/
+    FSDP2 Muon uses all-to-all communications: https://www.essential.ai/blog/infra
+    NorDion2 optimizer: https://arxiv.org/abs/2510.05491
     """
 
     def __init__(
@@ -61,24 +66,25 @@ class Dion2(Optimizer):
         params: ParamsT,
         distributed_mesh: Optional[Union[DeviceMesh, ProcessGroup]] = None,
         lr: float = 0.01,
-        fraction: float = 0.25,
-        ef_decay: float = 0.95,
+        mu: float = 0.95,
+        muon_beta2: float = 0.95,
         betas: Tuple[float, float] = (0.9, 0.95),
         weight_decay: float = 0.01,
+        cautious_wd: bool = False,
         epsilon: float = 1e-8,
-        adjust_lr: Optional[str] = "spectral_norm",
+        nesterov: bool = False,
+        adjust_lr: Optional[str] = "rms_norm",
         flatten: bool = False,
         use_triton: bool = False,
         newton_schulz_func: Optional[Callable] = None,
-        verbose: bool = False,
     ):
-        # Validate hyperparameters
+        # Check hyperparameters
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
-        if not (0.0 < fraction <= 1.0):
-            raise ValueError(f"fraction must be in (0, 1], got {fraction}")
-        if ef_decay < 0.0:
-            raise ValueError(f"Invalid ef_decay: {ef_decay}")
+        if mu < 0.0:
+            raise ValueError(f"Invalid momentum factor (mu): {mu}")
+        if muon_beta2 < 0.0:
+            raise ValueError(f"Invalid muon_beta2: {muon_beta2}")
         if len(betas) != 2 or betas[0] < 0.0 or betas[1] < 0.0:
             raise ValueError(f"Invalid betas: {betas}")
         if adjust_lr not in ("spectral_norm", "rms_norm", None):
@@ -86,18 +92,21 @@ class Dion2(Optimizer):
                 f"Invalid adjust_lr value: {adjust_lr}. Must be 'spectral_norm', 'rms_norm', or None."
             )
 
+        # Default arguments for each param group
         defaults = dict(
             lr=lr,
-            ef_decay=ef_decay,
-            fraction=fraction,
+            mu=mu,
+            muon_beta2=muon_beta2,
             beta1=betas[0],
             beta2=betas[1],
             weight_decay=weight_decay,
+            cautious_wd=cautious_wd,
+            algorithm="nordion2",
+            step=0,
             epsilon=epsilon,
+            nesterov=nesterov,
             flatten=flatten,
             adjust_lr=adjust_lr,
-            algorithm="dion2",
-            step=0,
         )
         super().__init__(params, defaults)
 
@@ -105,7 +114,7 @@ class Dion2(Optimizer):
         if isinstance(distributed_mesh, DeviceMesh):
             if distributed_mesh.ndim != 1:
                 raise ValueError(
-                    f"Only 1D DeviceMesh supported, but got {distributed_mesh.ndim}D. For HSDP, provide the 1D sharded sub-mesh."
+                    f"Only 1D DeviceMesh is supported, but got {distributed_mesh.ndim}D. For HSDP, provide the 1D sharded sub-mesh."
                 )
             self._device_rank = distributed_mesh.get_local_rank()
             self._world_size = distributed_mesh.size()
@@ -135,7 +144,6 @@ class Dion2(Optimizer):
             self._newton_schulz_func = newton_schulz_triton
         else:
             self._newton_schulz_func = zeropower_via_newtonschulz5
-        self.verbose = verbose
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -147,7 +155,7 @@ class Dion2(Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
-        dion2_groups = []
+        nordion2_groups = []
         lion_groups = []
         adamw_groups = []
 
@@ -157,8 +165,8 @@ class Dion2(Optimizer):
 
             # Split parameter groups by algorithm
             algo = group["algorithm"]
-            if algo == "dion2":
-                dion2_groups.append(group)
+            if algo == "nordion2":
+                nordion2_groups.append(group)
             elif algo == "lion":
                 lion_groups.append(group)
             elif algo == "adamw":
@@ -167,11 +175,11 @@ class Dion2(Optimizer):
                 raise ValueError(f"Unknown algorithm: {algo}")
 
         # Create async tasks for each algorithm
-        dion2_tasks = self._create_dion2_tasks(dion2_groups, verbose=self.verbose)
+        nordion2_tasks = self._create_nordion2_tasks(nordion2_groups)
         lion_tasks = self._create_lion_tasks(lion_groups)
         adamw_tasks = self._create_adamw_tasks(adamw_groups)
 
-        all_tasks = chain(dion2_tasks, lion_tasks, adamw_tasks)
+        all_tasks = chain(nordion2_tasks, lion_tasks, adamw_tasks)
         runtime = AsyncRuntime(all_tasks, max_concurrent_tasks=3)
         runtime.run()
 
@@ -187,42 +195,44 @@ class Dion2(Optimizer):
             state["momentum"] = torch.zeros_like(param)
             if algo == "adamw":
                 state["variance"] = torch.zeros_like(param)
+            if algo == "nordion2":
+                state["variance_neuron"] = torch.zeros_like(param[..., 0:1])
         return state
 
-    def _create_dion2_tasks(
+    def _create_nordion2_tasks(
         self,
         param_groups: List[dict],
-        verbose: bool = False,
+        algo_name: str = "nordion2",
     ) -> Generator["AsyncTask", None, None]:
         """
-        Helper function to create batches of Dion2 matrices and generate
+        Helper function to create batches of NorDion2 matrices and generate
         AsyncTask objects so we can process multiple batches concurrently.
         """
         for group in param_groups:
-            assert group["algorithm"] == "dion2"
+            assert group["algorithm"] == algo_name
             assert all(
                 p.ndim >= 2 for p in group["params"]
-            ), "Dion2 only supports matrix parameters."
+            ), "NorDion2 optimizer only supports matrix parameters."
 
             group_params = [p for p in group["params"] if p.grad is not None]
             if not group_params:
                 continue
 
-            # Most hyperparameters as tensors for torch.compile
-            # Here "fraction" only determines the dimension of the submatrix
-            # to be orthonormalized. Hence, it doesn't need to be a tensor
-            dion2_args = dict(
+            # Wrap hyperparameters in tensors for torch.compile
+            nordion2_update_args = dict(
                 lr=torch.tensor(group["lr"]),
-                ef_decay=torch.tensor(group["ef_decay"]),
-                fraction=group["fraction"],
+                momentum=torch.tensor(group["mu"]),
+                muon_beta2=torch.tensor(group["muon_beta2"]),
                 weight_decay=torch.tensor(group["weight_decay"]),
                 epsilon=torch.tensor(group["epsilon"]),
+                nesterov=group["nesterov"],
                 flatten=group["flatten"],
                 adjust_lr=group["adjust_lr"],
                 device_rank=self._device_rank,
                 world_size=self._world_size,
                 process_group=self._process_group,
                 newton_schulz_func=self._newton_schulz_func,
+                cautious_wd=group["cautious_wd"],
             )
 
             # Create batches of parameters of size self._world_size
@@ -230,8 +240,9 @@ class Dion2(Optimizer):
                 group_params, batch_size=self._world_size
             ):
                 gradients = [p.grad for p in params]
-                states = [self._get_or_initialize_state(p, "dion2") for p in params]
+                states = [self._get_or_initialize_state(p, algo_name) for p in params]
                 momentums = [s["momentum"] for s in states]
+                variances_neuron = [s["variance_neuron"] for s in states]
 
                 # Get sharding state for DTensor
                 is_batch_sharded = False
@@ -264,6 +275,14 @@ class Dion2(Optimizer):
                             (i, p) for i, p in shard_placements if p.dim in matrix_dims
                         ]
 
+                    # We currently do not support tensors sharded along the last dimension because NorDion2
+                    # normalization later assumes a full trailing axis when computing means.
+                    if any(p.dim == params[0].ndim - 1 for _, p in shard_placements):
+                        raise NotImplementedError(
+                            "NorDion2 currently does not support parameters sharded along the last dimension. "
+                            "Please avoid shards at dim -1."
+                        )
+
                     # Check that we have no more than 1 sharded matrix dimension
                     # Note that non-flattened 3D tensors can have additional sharded batch dimensions
                     # Flattened 3D tensors are limited to one sharded dimension out of all dimensions
@@ -273,7 +292,7 @@ class Dion2(Optimizer):
                         sharded_tensor_dim = shard_placements[0][1].dim
                     elif len(shard_placements) > 1:
                         raise NotImplementedError(
-                            "Dion2 does not support parameters with multiple sharded dimensions."
+                            "NorDion2 does not support parameters with multiple sharded dimensions."
                         )
 
                     # Check that the sharded mesh dimension matches optimizer's device mesh
@@ -291,27 +310,29 @@ class Dion2(Optimizer):
                 # As long as matrix dimensions are not sharded, each device will have whole matrices
                 # Each device already has different matrices of the batch, so we can't parallelize further
                 if is_batch_sharded and not is_matrix_sharded:
-                    for x, g, m in zip(params, gradients, momentums):
+                    for x, g, m, v in zip(
+                        params, gradients, momentums, variances_neuron
+                    ):
                         yield AsyncTask(
-                            dion2_update_batch_async(
+                            nordion2_update_batch_async(
                                 X=[x],
                                 G=[g],
                                 M=[m],
+                                V=[v],
                                 shard_dim=None,  # No sharded matrix dim
-                                **dion2_args,
-                                verbose=verbose,
+                                **nordion2_update_args,
                             )
                         )
-                # Otherwise, we parallelize the Muon update across devices
+                # Otherwise, we parallelize the NorDion2 update across devices
                 else:
                     yield AsyncTask(
-                        dion2_update_batch_async(
+                        nordion2_update_batch_async(
                             X=pad_batch(params, self._world_size),
                             G=pad_batch(gradients, self._world_size),
                             M=pad_batch(momentums, self._world_size),
+                            V=pad_batch(variances_neuron, self._world_size),
                             shard_dim=sharded_tensor_dim,
-                            **dion2_args,
-                            verbose=verbose,
+                            **nordion2_update_args,
                         )
                     )
 
@@ -339,6 +360,7 @@ class Dion2(Optimizer):
             beta1 = torch.tensor(group["beta1"])
             beta2 = torch.tensor(group["beta2"])
             weight_decay = torch.tensor(group["weight_decay"])
+            cautious_wd = group["cautious_wd"]
 
             yield AsyncTask(
                 lion_update_foreach_async(
@@ -349,6 +371,7 @@ class Dion2(Optimizer):
                     beta1=beta1,
                     beta2=beta2,
                     weight_decay=weight_decay,
+                    cautious_wd=cautious_wd,
                 )
             )
 
@@ -377,6 +400,7 @@ class Dion2(Optimizer):
             beta1 = torch.tensor(group["beta1"])
             beta2 = torch.tensor(group["beta2"])
             weight_decay = torch.tensor(group["weight_decay"])
+            cautious_wd = group["cautious_wd"]
             epsilon = torch.tensor(group["epsilon"])
             step = torch.tensor(group["step"])
 
@@ -392,19 +416,22 @@ class Dion2(Optimizer):
                     weight_decay=weight_decay,
                     step=step,
                     epsilon=epsilon,
+                    cautious_wd=cautious_wd,
                 )
             )
 
 
-def dion2_update_batch_async(
+def nordion2_update_batch_async(
     X: List[Tensor],  # Model weights (modified in place)
     G: List[Tensor],  # Gradient
     M: List[Tensor],  # Momentum buffer (modified in place)
+    V: List[Tensor],  # Variance neuron buffer (modified in place)
     lr: Tensor,  # Learning rate (scalar tensor)
-    ef_decay: Tensor,  # Error-feedback factor (scalar tensor)
-    fraction: float,  # Fraction of submatrix to orthogonalize (0 < fraction <= 1)
+    momentum: Tensor,  # Momentum factor (scalar tensor)
+    muon_beta2: Tensor,  # Muon beta2 for normalization
     weight_decay: Tensor,  # Weight decay (scalar tensor)
     epsilon: Tensor,  # Epsilon (scalar tensor)
+    nesterov: bool,  # Whether to use Nesterov momentum
     flatten: bool,  # Whether to flatten 3D+ tensors to 2D
     adjust_lr: Optional[str],  # How to adjust learning rate
     device_rank: int,  # Rank of the current device
@@ -412,46 +439,23 @@ def dion2_update_batch_async(
     shard_dim: Optional[int] = None,  # Shard dimension for DTensor (if applicable)
     process_group: Optional[ProcessGroup] = None,
     newton_schulz_func: Optional[Callable] = None,
-    verbose: bool = False,
+    cautious_wd: bool = False,
 ) -> Generator[None, None, None]:
     """
-    Batched version of Dion2 update. Batch size should be equal to number of GPUs.
+    Batched version of Muon update. Batch size should be equal to number of GPUs.
     All tensors in a batch should have identical shape, sharding, and dtype.
     Identical hyperparameters are used for all tensors in the batch.
     """
+
     assert len(X) == len(G)
     assert len(X) == len(M)
 
-    # Determine selection dimension based on sharding and tensor shape:
-    # For sharded matrices, we align select_dim with shard_dim
-    # For unsharded matrices (DDP or single-GPU), we select the shorter dimension
-    ndim = X[0].ndim
-    select_dim = None
-
-    if shard_dim is not None:
-        # Normalize shard_dim to negative indexing for unified treatment
-        shard_dim = shard_dim if shard_dim < 0 else shard_dim - ndim
-        if shard_dim == -2:
-            select_dim = -2  # Row-sharded
-        elif shard_dim == -1:
-            select_dim = -1  # Column-sharded
-
-    # Fall-back to shorter dimension when DDP, Single-GPU, or batch-sharded
-    if select_dim is None:
-        num_rows, num_cols = X[0].shape[-2:]
-        select_dim = -2 if num_rows <= num_cols else -1
-
-    # Print how the selection choice based on shard_dim and tensor shape
-    if verbose:
-        _print_selection_choice(X[0].shape, shard_dim, select_dim, ndim)
-
-    # Update momentum and select top-α fraction along select_dim
-    U_selected, indices_list = dion2_pre_orthogonalize(
+    # Update momentum and compute the inputs for orthogonalization
+    U = muon_update_pre_orthogonalize(
         G=to_local(G),
         M=to_local(M),
-        fraction=fraction,
-        ef_decay=ef_decay,
-        select_dim=select_dim,
+        momentum=momentum,
+        nesterov=nesterov,
     )
 
     # Get one whole matrix for each device to orthogonalize
@@ -463,59 +467,67 @@ def dion2_update_batch_async(
             process_group is not None
         ), "process_group must be provided for sharded DTensors"
         assert isinstance(X[0], DTensor), "X should contain DTensors"
+        assert not isinstance(U[0], DTensor), "U should contain local shards"
         assert (
             X[0].size(shard_dim) % world_size == 0
         ), f"Shard dimension {shard_dim} size {X[0].size(shard_dim)} is not divisible by world size {world_size}."
 
-        # Allocate buffers to receive shards of one whole submatrix from other devices
-        recv_shards = [torch.empty_like(u) for u in U_selected]
+        # Allocate buffers to receive shards of one whole matrix from other devices
+        single_matrix_shards = [torch.empty_like(u) for u in U]
+
+        # Redistribute the shards to form one unique full tensor on each device
         work = dist.all_to_all(
-            recv_shards, U_selected, group=process_group, async_op=True
+            single_matrix_shards, U, group=process_group, async_op=True
         )
         yield
         work.wait()
 
         # Concatentate shards to form a whole matrix to orthogonalize
-        # Only submatrix is orthogonalized!
-        full_submatrix = torch.cat(recv_shards, dim=select_dim)
-        full_submatrix = muon_update_newton_schulz(
-            full_submatrix, newton_schulz_func, flatten=flatten, epsilon=epsilon
+        single_matrix = torch.cat(single_matrix_shards, dim=shard_dim)
+        single_matrix = muon_update_newton_schulz(
+            single_matrix,
+            newton_schulz_func=newton_schulz_func,
+            flatten=flatten,
+            epsilon=epsilon,
         )
 
         # Split result back into shards
         # Contiguous is needed for all-to-all to work correctly
-        send_shards = [
-            t.contiguous()
-            for t in torch.tensor_split(full_submatrix, world_size, dim=select_dim)
+        single_matrix_shards = [
+            x.contiguous()
+            for x in torch.tensor_split(single_matrix, world_size, dim=shard_dim)
         ]
 
         # Redistribute the orthogonalized tensor back to original layout
-        U_ortho = [torch.empty_like(u) for u in U_selected]
-        work = dist.all_to_all(U_ortho, send_shards, group=process_group, async_op=True)
+        work = dist.all_to_all(
+            U, single_matrix_shards, group=process_group, async_op=True
+        )
+        #
         yield
         work.wait()
 
     # Matrices are not sharded, so we can distribute the batch across different devices
     # Get a single matrix of the batch corresponding to this device
-    elif len(U_selected) > 1:
-        assert len(U_selected) == world_size, "Batch size must equal world size"
+    elif len(U) > 1:
+        assert len(U) == world_size, "Batch size must equal world size"
         assert process_group is not None
 
-        single_matrix = U_selected[device_rank]
+        single_matrix = U[device_rank]
         assert not isinstance(single_matrix, DTensor)
 
-        single_ortho = muon_update_newton_schulz(
+        single_matrix = muon_update_newton_schulz(
             single_matrix,
-            newton_schulz_func,
+            newton_schulz_func=newton_schulz_func,
             flatten=flatten,
             epsilon=epsilon,
         )
 
         # Allocate empty tensors to receive updates from other devices
-        U_ortho = [torch.empty_like(u) for u in U_selected]
+        U = [torch.empty_like(u) for u in U]
+
         # All gather orthogonalized results from other devices into buffer
         work = dist.all_gather(
-            U_ortho, single_ortho.contiguous(), group=process_group, async_op=True
+            U, single_matrix.contiguous(), group=process_group, async_op=True
         )
         yield
         work.wait()
@@ -524,12 +536,20 @@ def dion2_update_batch_async(
     # - Running on a single GPU
     # - 3D+ tensors sharded along a batch dimension (different whole matrices per device)
     else:
-        assert len(U_selected) == 1
-        U_ortho = [
-            muon_update_newton_schulz(
-                U_selected[0], newton_schulz_func, flatten=flatten, epsilon=epsilon
-            )
-        ]
+        assert len(U) == 1
+        U[0] = muon_update_newton_schulz(
+            U[0],
+            newton_schulz_func=newton_schulz_func,
+            flatten=flatten,
+            epsilon=epsilon,
+        )
+
+    # NorDion2 normalization
+    U = nordion2_normalization(
+        U,
+        V=to_local(V),
+        muon_beta2=muon_beta2,
+    )
 
     # Compute scaled learning rate
     # Do this before to_local(X) because we use the full tensor shape, not the shard shape
@@ -540,149 +560,90 @@ def dion2_update_batch_async(
     elif adjust_lr == "rms_norm":
         adjusted_lr = adjust_lr_rms_norm(lr, X[0].shape, flatten=flatten)
     else:
-        raise ValueError(f"Unknown adjust_lr: {adjust_lr}")
+        raise ValueError(f"Unknown adjust_lr value: {adjust_lr}")
 
     # Update model parameters with orthogonalized output
-    # Weight update is applied to selected slices only
-    dion2_post_orthogonalize(
+    muon_update_post_orthogonalize(
         X=to_local(X),
-        U=U_ortho,
-        indices=indices_list,
+        U=U,
         base_lr=lr,
         adjusted_lr=adjusted_lr,
         weight_decay=weight_decay,
-        select_dim=select_dim,
+        cautious_wd=cautious_wd,
     )
 
 
 @torch.compile(fullgraph=True)
-def dion2_pre_orthogonalize(
+def nordion2_normalization(
+    U: List[Tensor],
+    V: List[Tensor],
+    muon_beta2: Tensor,
+) -> List[Tensor]:
+    """
+    NorDion2 normalization step after orthogonalization.
+    Inputs and outputs should be lists of regular Tensor, not DTensor.
+    This is a separate function for compatibility with torch.compile().
+    """
+    V_dtype = V[0].dtype
+    U = [u.to(dtype=V_dtype) for u in U]
+    
+    norm_U = [
+        u.norm(p=2, dim=(-2, -1), keepdim=True) for u in U
+    ]  # list of ||u||_F, shape [*, 1, 1]
+
+    U_sq = torch._foreach_mul(U, U)  # list of u*u, same shapes as U
+    neuron_norms = [u_sq.mean(dim=-1, keepdim=True) for u_sq in U_sq]  # Shape: [*, rows, 1]
+    
+    torch._foreach_lerp_(
+        V, neuron_norms, 1 - muon_beta2
+    )  # Update variance neuron buffer
+
+    denom = torch._foreach_sqrt(V)  # list of sqrt(v)
+    torch._foreach_add_(denom, 1e-8)  # denom[i] += 1e-8
+    normalized_U = torch._foreach_div(U, denom)  # list of u / denom
+
+    norm_U_new = [
+        nu.norm(p=2, dim=(-2, -1), keepdim=True) for nu in normalized_U
+    ]  # list of ||normalized_u||_F, shape [*, 1, 1]
+    
+    # Protect against division by zero when norm_U_new is zero.
+    # This can happen when U is all zeros (e.g., zero gradients from zero-initialized weights).
+    # In this case, norm_U is also zero, so after clamping norm_U_new to ε the ratio becomes 0/ε ≈ 0,
+    # and normalized_U * ratio correctly remains zero, preserving the zero state.
+    norm_U_new_safe = [nu.clamp(min=1e-8) for nu in norm_U_new]
+    
+    ratio = torch._foreach_div(
+        norm_U, norm_U_new_safe
+    )  # list of ||u||_F / ||normalized_u||_F, shape [*, 1, 1]
+    
+    torch._foreach_mul_(normalized_U, ratio)  # normalized_u[i] *= ratio
+
+    return normalized_U
+
+def muon_update_pre_orthogonalize(
     G: List[Tensor],
     M: List[Tensor],
-    fraction: Tensor,
-    ef_decay: Tensor,
-    select_dim: int,
-) -> Tuple[List[Tensor], List[Tensor]]:
+    momentum: Tensor,
+    nesterov: bool,
+) -> List[Tensor]:
     """
     Update momentum with gradient and compute the input to orthogonalization.
-    More specifically, it does the following steps:
-        - updates the momentum with gradient
-        - computes the top-k indices (according to L1 norm) to determine submatrices
-        - (other norms can be used such as L2 norm)
-        - does in-place error-feedback decay on the selected submatrices
-        - output submatrices and indices
     Inputs and outputs should be lists of regular Tensor, not DTensor.
     This is a separate function for compatibility with torch.compile().
     """
     dtype = M[0].dtype
-
-    # norm_dim is the dimension we compute norm over
-    # select_dim is the dimension we select submatrix from
-    num_select = M[0].size(select_dim)
-    norm_dim = -1 if select_dim == -2 else -2
-    k = max(1, int(math.ceil(fraction * num_select)))
-
-    # Update momentum: M = M + G
     G = [g.to(dtype=dtype) for g in G]
+
+    # Update momentum with new gradient
     torch._foreach_add_(M, G)
+    # print(nesterov)
+    assert nesterov == False
+    U = M
 
-    M_stacked = torch.stack(M, dim=0)
+    # delay momentum update to match dion2
+    torch._foreach_mul_(M, momentum)
 
-    # Compute L1 norm along norm_dim (sum of absolute values)
-    slice_norms = M_stacked.norm(p=1, dim=norm_dim)
+    # Convert to bfloat16 before communication
+    U = [u.to(dtype=torch.bfloat16) for u in U]
 
-    # Batched topk: indices shape (batch_size, k)
-    _, indices = torch.topk(slice_norms, k, dim=-1, sorted=False)
-
-    # Batched gather for slice extraction
-    if select_dim == -2:
-        # Selecting rows
-        num_cols = M[0].size(-1)
-        indices_expanded = indices.unsqueeze(-1).expand(-1, -1, num_cols)
-        selected_stacked = torch.gather(M_stacked, dim=-2, index=indices_expanded)
-    else:
-        # Selecting cols
-        num_rows = M[0].size(-2)
-        indices_expanded = indices.unsqueeze(-2).expand(-1, num_rows, -1)
-        selected_stacked = torch.gather(M_stacked, dim=-1, index=indices_expanded)
-
-    # Apply error feedback decay to selected slices in original M tensors
-    indices_list = list(indices.unbind(dim=0))
-    for m, idx in zip(M, indices_list):
-        selected_slice = m.index_select(dim=select_dim, index=idx)
-        m.index_copy_(dim=select_dim, index=idx, source=selected_slice * ef_decay)
-
-    # Convert to bf16 and unstack for communication
-    U_selected = list(selected_stacked.to(dtype=torch.bfloat16).unbind(dim=0))
-
-    return U_selected, indices_list
-
-
-@torch.compile(fullgraph=True)
-def dion2_post_orthogonalize(
-    X: List[Tensor],
-    U: List[Tensor],
-    indices: List[Tensor],
-    base_lr: Tensor,
-    adjusted_lr: Tensor,
-    weight_decay: Tensor,
-    select_dim: int,
-):
-    """
-    Apply weight decay and weight update after orthogonalization.
-    Inputs and outputs should be lists of regular Tensor, not DTensor.
-    This is a separate function for compatibility with torch.compile().
-    """
-    # Convert U to match parameter dtype
-    dtype = X[0].dtype
-    U = [u.to(dtype=dtype) for u in U]
-    # Apply weight update
-    neg_lr = -adjusted_lr
-    U_scaled = [neg_lr * u for u in U]
-    for x, u_scaled, idx in zip(X, U_scaled, indices):
-        x.index_add_(dim=select_dim, index=idx, source=u_scaled)
-
-    #ADana style weight decay
-    torch._foreach_mul_(X, 1 - weight_decay)
-
-# A helper function to print selection chocie for each matrix
-# It only prints once `verbose` is set True
-_printed_configs: set = set()
-
-
-def _print_selection_choice(
-    shape: torch.Size,
-    shard_dim: Optional[int],
-    select_dim: int,
-    ndim: int,
-):
-    config_key = (tuple(shape), shard_dim, select_dim)
-    if config_key not in _printed_configs:
-        _printed_configs.add(config_key)
-
-        num_rows, num_cols = shape[-2:]
-        select_info = "rows" if select_dim == -2 else "columns"
-        norm_info = "row norms" if select_dim == -2 else "col norms"
-
-        if shard_dim is None:
-            mode = "DDP/Single-GPU"
-            shorter = "rows" if num_rows <= num_cols else "cols"
-            reason = f"shorter dim = {shorter} ({min(num_rows, num_cols)})"
-        else:
-            # Normalize shard_dim for display
-            normalized = shard_dim if shard_dim < 0 else shard_dim - ndim
-            if normalized == -2:
-                mode = "FSDP"
-                reason = f"row-sharded (shard_dim={shard_dim}→-2)"
-            elif normalized == -1:
-                mode = "FSDP"
-                reason = f"col-sharded (shard_dim={shard_dim}→-1)"
-            else:
-                mode = "FSDP batch-sharded"
-                shorter = "rows" if num_rows <= num_cols else "cols"
-                reason = f"shard_dim={shard_dim} (batch), shorter = {shorter}"
-
-        print(
-            f"[Dion2] Shape {tuple(shape)}: {mode}, {reason} → "
-            f"select top-α {select_info} by {norm_info}"
-        )
+    return U

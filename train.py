@@ -29,6 +29,7 @@ from dion import Muon
 from dion import MuonReference
 from dion import Dion2
 from dion import NorMuon
+from dion import NorDion2
 
 
 @dataclass
@@ -64,6 +65,8 @@ class Hyperparameters:
     lr: float = 0.02
     mu: float = 0.95
     weight_decay: float = 0.01
+    omega: float = 0.01
+    wd_time_scale_ratio: float = 0.1
     ortho_fraction: float = 0.25
 
     # Optimizer specific hyperparameters
@@ -135,6 +138,8 @@ def parse_cli_args():
     parser.add_argument(
         "--mixed_precision", action="store_true", help="Use mixed precision for Dion"
     )
+    parser.add_argument("--omega", type=float, default=None, help="Weight decay omega parameter")
+    parser.add_argument("--wd_time_scale_ratio", type=float, default=None, help="Weight decay time scale ratio")
 
     # ---------- model ----------
     parser.add_argument("--model_dim", type=int, default=None)
@@ -472,7 +477,35 @@ def init_optimizer(
             mu=hp.mu,
             muon_beta2=0.95,
             weight_decay=hp.weight_decay,
-            nesterov=True,
+            nesterov=False,
+            adjust_lr=hp.adjust_lr,
+            use_triton=(not cli_args.no_triton),
+        )
+
+    elif hp.optimizer == "nordion2":
+        if device_mesh is not None:
+            # Ensure that we have a supported device mesh configuration for NorDion2
+            if inner_shard_mesh is not None and inner_shard_mesh.size() > 1:
+                raise ValueError("Tensor parallel is not supported by NorDion2.")
+            distributed_mesh = (
+                outer_shard_mesh if outer_shard_mesh.size() > 1 else replicate_mesh
+            )
+            comm_method = "all-to-all" if outer_shard_mesh.size() > 1 else "all-gather"
+        else:
+            assert ddp_model is not None
+            distributed_mesh = ddp_model.process_group  # using ProcessGroup for DDP
+            comm_method = "all-gather"
+        print0(f"NorDion2 LR adjust method: {hp.adjust_lr}")
+        print0(f"Triton Newton-Schulz kernels: {not cli_args.no_triton}")
+        print0(f"Distributed NorDion2 using: {comm_method}")
+        opt = NorDion2(
+            param_groups,
+            distributed_mesh=distributed_mesh,
+            lr=hp.lr,
+            mu=hp.mu,
+            muon_beta2=0.95,
+            weight_decay=hp.weight_decay,
+            nesterov=False,
             adjust_lr=hp.adjust_lr,
             use_triton=(not cli_args.no_triton),
         )
@@ -790,6 +823,10 @@ def main():
         cli_args=cli_args,
     )
 
+    # Tag each param group with its initial weight_decay for scheduling
+    for group in optimizer.param_groups:
+        group["initial_weight_decay"] = group["weight_decay"]
+
     # Learning rate scheduler
     def get_lr(it):
         warmup_iters = round(hp.warmup_ratio * hp.num_iterations)
@@ -869,6 +906,7 @@ def main():
                 id=wandb_id,
                 resume=resume,
             )
+            wandb.run.log_code(".")
             # If we got a new ID, update the checkpoint manager
             checkpoint_manager.wandb_id = wandb.run.id
 
@@ -972,10 +1010,23 @@ def main():
         grad_norm = torch.nn.utils.get_total_norm(
             [p.grad for p in model.parameters() if p.grad is not None]
         )
+        # Parameter norm
+        param_norm = torch.nn.utils.get_total_norm(
+            [p for p in model.parameters()]
+        )
+
+        # Update weight_decay before optimizer step so it uses the scheduled value
+        cur_lr_ratio = get_lr(step)
+        wd_time_scale = max(hp.num_iterations * hp.wd_time_scale_ratio, 1.0)
+        new_wd = hp.omega / wd_time_scale / (1.0 + step / wd_time_scale) * cur_lr_ratio
+        for group in optimizer.param_groups:
+            if group.get("initial_weight_decay", 0) > 0:
+                group["weight_decay"] = new_wd
 
         # Optimizer step
         optimizer.step()
         lr_scheduler.step()
+
         model.zero_grad(set_to_none=True)
 
         # Approximate updated training time just before logging
@@ -985,13 +1036,14 @@ def main():
                 {
                     "train/loss": train_loss.item(),
                     "train/grad_norm": grad_norm.item(),
+                    "train/param_norm": param_norm.item(),
                     "step": step,
                     "time/training_time_ms": approx_time,  # Log approximate elapsed training time in ms
                 }
             )
         if MASTER_PROCESS and cli_args.debug:
             print0(
-                f"Step {step}: train_loss={train_loss.item():.4f}, grad_norm={grad_norm.item():.4f}"
+                f"Step {step}: train_loss={train_loss.item():.4f}, grad_norm={grad_norm.item():.4f}, param_norm={param_norm.item():.4f}"
             )
         pbar.update(1)
         pbar.set_postfix(train_loss=f"{train_loss.item():.4f}")
