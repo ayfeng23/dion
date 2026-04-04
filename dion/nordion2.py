@@ -21,11 +21,11 @@ from .scalar_opts import adamw_update_foreach_async, lion_update_foreach_async
 # Reuse Muon's helper functions
 from .muon import (
     muon_update_newton_schulz,
-    muon_update_post_orthogonalize,
     zeropower_via_newtonschulz5,
     adjust_lr_spectral_norm,
     adjust_lr_rms_norm,
 )
+from .dion2 import dion2_post_orthogonalize
 
 
 class NorDion2(Optimizer):
@@ -38,6 +38,7 @@ class NorDion2(Optimizer):
             Use DeviceMesh for FSDP2 and ProcessGroup for DistributedDataParallel.
         lr: Base learning rate. For NorDion2, this will be scaled based on the matrix dimensions.
             For element-wise update rules, this is the actual learning rate and no additional scaling is done.
+        fraction: Fraction of submatrix to orthogonalize per update (0 < fraction <= 1).
         mu: Momentum factor for NorDion2 algorithm.
         muon_beta2: Second beta parameter for NorDion2 algorithm's adaptive updates.
         betas: Tuple of (beta1, beta2) for AdamW and Lion algorithms.
@@ -66,6 +67,7 @@ class NorDion2(Optimizer):
         params: ParamsT,
         distributed_mesh: Optional[Union[DeviceMesh, ProcessGroup]] = None,
         lr: float = 0.01,
+        fraction: float = 0.25,
         mu: float = 0.95,
         muon_beta2: float = 0.95,
         betas: Tuple[float, float] = (0.9, 0.95),
@@ -95,6 +97,7 @@ class NorDion2(Optimizer):
         # Default arguments for each param group
         defaults = dict(
             lr=lr,
+            fraction=fraction,
             mu=mu,
             muon_beta2=muon_beta2,
             beta1=betas[0],
@@ -221,6 +224,7 @@ class NorDion2(Optimizer):
             # Wrap hyperparameters in tensors for torch.compile
             nordion2_update_args = dict(
                 lr=torch.tensor(group["lr"]),
+                fraction=group["fraction"],
                 momentum=torch.tensor(group["mu"]),
                 muon_beta2=torch.tensor(group["muon_beta2"]),
                 weight_decay=torch.tensor(group["weight_decay"]),
@@ -427,6 +431,7 @@ def nordion2_update_batch_async(
     M: List[Tensor],  # Momentum buffer (modified in place)
     V: List[Tensor],  # Variance neuron buffer (modified in place)
     lr: Tensor,  # Learning rate (scalar tensor)
+    fraction: float,  # Fraction of submatrix to orthogonalize (0 < fraction <= 1)
     momentum: Tensor,  # Momentum factor (scalar tensor)
     muon_beta2: Tensor,  # Muon beta2 for normalization
     weight_decay: Tensor,  # Weight decay (scalar tensor)
@@ -450,8 +455,11 @@ def nordion2_update_batch_async(
     assert len(X) == len(G)
     assert len(X) == len(M)
 
+    # Choose Neurons
+    select_dim = -2
+
     # Update momentum and compute the inputs for orthogonalization
-    U = muon_update_pre_orthogonalize(
+    U_selected, indices_list = nordion2_update_pre_orthogonalize(
         G=to_local(G),
         M=to_local(M),
         momentum=momentum,
@@ -467,17 +475,17 @@ def nordion2_update_batch_async(
             process_group is not None
         ), "process_group must be provided for sharded DTensors"
         assert isinstance(X[0], DTensor), "X should contain DTensors"
-        assert not isinstance(U[0], DTensor), "U should contain local shards"
+        assert not isinstance(U_selected[0], DTensor), "U should contain local shards"
         assert (
             X[0].size(shard_dim) % world_size == 0
         ), f"Shard dimension {shard_dim} size {X[0].size(shard_dim)} is not divisible by world size {world_size}."
 
         # Allocate buffers to receive shards of one whole matrix from other devices
-        single_matrix_shards = [torch.empty_like(u) for u in U]
+        single_matrix_shards = [torch.empty_like(u) for u in U_selected]
 
         # Redistribute the shards to form one unique full tensor on each device
         work = dist.all_to_all(
-            single_matrix_shards, U, group=process_group, async_op=True
+            single_matrix_shards, U_selected, group=process_group, async_op=True
         )
         yield
         work.wait()
@@ -499,8 +507,9 @@ def nordion2_update_batch_async(
         ]
 
         # Redistribute the orthogonalized tensor back to original layout
+        U_ortho = [torch.empty_like(u) for u in U_selected]
         work = dist.all_to_all(
-            U, single_matrix_shards, group=process_group, async_op=True
+            U_ortho, single_matrix_shards, group=process_group, async_op=True
         )
         #
         yield
@@ -508,11 +517,11 @@ def nordion2_update_batch_async(
 
     # Matrices are not sharded, so we can distribute the batch across different devices
     # Get a single matrix of the batch corresponding to this device
-    elif len(U) > 1:
-        assert len(U) == world_size, "Batch size must equal world size"
+    elif len(U_selected) > 1:
+        assert len(U_selected) == world_size, "Batch size must equal world size"
         assert process_group is not None
 
-        single_matrix = U[device_rank]
+        single_matrix = U_selected[device_rank]
         assert not isinstance(single_matrix, DTensor)
 
         single_matrix = muon_update_newton_schulz(
@@ -523,11 +532,11 @@ def nordion2_update_batch_async(
         )
 
         # Allocate empty tensors to receive updates from other devices
-        U = [torch.empty_like(u) for u in U]
+        U_ortho = [torch.empty_like(u) for u in U_selected]
 
         # All gather orthogonalized results from other devices into buffer
         work = dist.all_gather(
-            U, single_matrix.contiguous(), group=process_group, async_op=True
+            U_ortho, single_matrix.contiguous(), group=process_group, async_op=True
         )
         yield
         work.wait()
@@ -536,20 +545,30 @@ def nordion2_update_batch_async(
     # - Running on a single GPU
     # - 3D+ tensors sharded along a batch dimension (different whole matrices per device)
     else:
-        assert len(U) == 1
-        U[0] = muon_update_newton_schulz(
-            U[0],
+        assert len(U_selected) == 1
+        U_ortho[0] = muon_update_newton_schulz(
+            U_selected[0],
             newton_schulz_func=newton_schulz_func,
             flatten=flatten,
             epsilon=epsilon,
         )
 
     # NorDion2 normalization
-    U = nordion2_normalization(
-        U,
-        V=to_local(V),
+    # Select V for each top-k row
+    V_sel = []
+    for v, indices in zip(V, indices_list):
+        selected_v = v.index_select(dim=select_dim, index=indices)
+        V_sel.append(selected_v)
+
+    U_normed, V_sel = nordion2_normalization(
+        U_ortho,
+        V=V_sel,
         muon_beta2=muon_beta2,
     )
+    
+    # Copy back update V_sel to V using indices
+    for v, v_sel, indices in zip(V, V_sel, indices_list):
+        v.index_copy_(dim=select_dim, index=indices, source=v_sel)
 
     # Compute scaled learning rate
     # Do this before to_local(X) because we use the full tensor shape, not the shard shape
@@ -563,44 +582,45 @@ def nordion2_update_batch_async(
         raise ValueError(f"Unknown adjust_lr value: {adjust_lr}")
 
     # Update model parameters with orthogonalized output
-    muon_update_post_orthogonalize(
+    dion2_post_orthogonalize(
         X=to_local(X),
-        U=U,
+        U=U_normed,
+        indices=indices_list,
         base_lr=lr,
         adjusted_lr=adjusted_lr,
         weight_decay=weight_decay,
-        cautious_wd=cautious_wd,
+        select_dim=-2,
     )
 
 
 @torch.compile(fullgraph=True)
 def nordion2_normalization(
-    U: List[Tensor],
-    V: List[Tensor],
+    U_ortho: List[Tensor],
+    V_sel: List[Tensor],
     muon_beta2: Tensor,
-) -> List[Tensor]:
+) -> Tuple[List[Tensor], List[Tensor]]:
     """
     NorDion2 normalization step after orthogonalization.
     Inputs and outputs should be lists of regular Tensor, not DTensor.
     This is a separate function for compatibility with torch.compile().
     """
-    V_dtype = V[0].dtype
-    U = [u.to(dtype=V_dtype) for u in U]
+    V_dtype = V_sel[0].dtype
+    U_ortho = [u.to(dtype=V_dtype) for u in U_ortho]
     
     norm_U = [
-        u.norm(p=2, dim=(-2, -1), keepdim=True) for u in U
+        u.norm(p=2, dim=(-2, -1), keepdim=True) for u in U_ortho
     ]  # list of ||u||_F, shape [*, 1, 1]
 
-    U_sq = torch._foreach_mul(U, U)  # list of u*u, same shapes as U
+    U_sq = torch._foreach_mul(U_ortho, U_ortho)  # list of u*u, same shapes as U_ortho
     neuron_norms = [u_sq.mean(dim=-1, keepdim=True) for u_sq in U_sq]  # Shape: [*, rows, 1]
     
     torch._foreach_lerp_(
-        V, neuron_norms, 1 - muon_beta2
+        V_sel, neuron_norms, 1 - muon_beta2
     )  # Update variance neuron buffer
 
-    denom = torch._foreach_sqrt(V)  # list of sqrt(v)
+    denom = torch._foreach_sqrt(V_sel)  # list of sqrt(v)
     torch._foreach_add_(denom, 1e-8)  # denom[i] += 1e-8
-    normalized_U = torch._foreach_div(U, denom)  # list of u / denom
+    normalized_U = torch._foreach_div(U_ortho, denom)  # list of u / denom
 
     norm_U_new = [
         nu.norm(p=2, dim=(-2, -1), keepdim=True) for nu in normalized_U
@@ -618,9 +638,9 @@ def nordion2_normalization(
     
     torch._foreach_mul_(normalized_U, ratio)  # normalized_u[i] *= ratio
 
-    return normalized_U
+    return normalized_U, V_sel
 
-def muon_update_pre_orthogonalize(
+def nordion2_update_pre_orthogonalize(
     G: List[Tensor],
     M: List[Tensor],
     momentum: Tensor,
@@ -632,18 +652,32 @@ def muon_update_pre_orthogonalize(
     This is a separate function for compatibility with torch.compile().
     """
     dtype = M[0].dtype
+
+    # norm_dim is the dimension we compute norm over
+    # select_dim is the dimension we select submatrix from
+    num_select = M[0].size(-2)
+    k = max(1, int(math.ceil(fraction * num_select)))
+
     G = [g.to(dtype=dtype) for g in G]
 
     # Update momentum with new gradient
     torch._foreach_add_(M, G)
     # print(nesterov)
     assert nesterov == False
-    U = M
 
-    # delay momentum update to match dion2
-    torch._foreach_mul_(M, momentum)
+    M_stacked = torch.stack(M, dim=0)
+    slice_norms = M_stacked.norm(p=1, dim=-1)
+    _, indices = torch.topk(slice_norms, k, dim=-1, sorted=False)
+    
+    # Selecting rows
+    num_cols = M[0].size(-1)
+    indices_expanded = indices.unsqueeze(-1).expand(-1, -1, num_cols)
+    selected_stacked = torch.gather(M_stacked, dim=-2, index=indices_expanded)
+    U_selected = list(selected_stacked.to(dtype=torch.bfloat16).unbind(dim=0))
 
-    # Convert to bfloat16 before communication
-    U = [u.to(dtype=torch.bfloat16) for u in U]
+    indices_list = list(indices.unbind(dim=0))
+    for m, idx in zip(M, indices_list):
+        selected_slice = m.index_select(dim=select_dim, index=idx)
+        m.index_copy_(dim=select_dim, index=idx, source=selected_slice * momentum)
 
-    return U
+    return U_selected, indices_list
