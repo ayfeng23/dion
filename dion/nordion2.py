@@ -1,6 +1,7 @@
 import math
 import torch
 import torch.distributed as dist
+import wandb
 from itertools import chain
 from torch import Tensor
 from torch.distributed import ProcessGroup
@@ -13,7 +14,9 @@ from .opt_utils import (
     AsyncRuntime,
     AsyncTask,
     create_param_batches,
+    create_named_batches,
     pad_batch,
+    pad_names,
     to_local,
 )
 from .scalar_opts import adamw_update_foreach_async, lion_update_foreach_async
@@ -72,6 +75,7 @@ class NorDion2(Optimizer):
         muon_beta2: float = 0.95,
         betas: Tuple[float, float] = (0.9, 0.95),
         weight_decay: float = 0.01,
+        k_sel: str = "topk",
         cautious_wd: bool = False,
         epsilon: float = 1e-8,
         nesterov: bool = False,
@@ -110,6 +114,7 @@ class NorDion2(Optimizer):
             nesterov=nesterov,
             flatten=flatten,
             adjust_lr=adjust_lr,
+            k_sel=k_sel,
         )
         super().__init__(params, defaults)
 
@@ -228,6 +233,7 @@ class NorDion2(Optimizer):
                 momentum=torch.tensor(group["mu"]),
                 muon_beta2=torch.tensor(group["muon_beta2"]),
                 weight_decay=torch.tensor(group["weight_decay"]),
+                k_sel=group["k_sel"],
                 epsilon=torch.tensor(group["epsilon"]),
                 nesterov=group["nesterov"],
                 flatten=group["flatten"],
@@ -240,9 +246,9 @@ class NorDion2(Optimizer):
             )
 
             # Create batches of parameters of size self._world_size
-            for params in create_param_batches(
-                group_params, batch_size=self._world_size
-            ):
+            for batch in create_named_batches(group_items, batch_size=self._world_size):
+                params = [p for p, _ in batch]
+                names  = [n for _, n in batch]
                 gradients = [p.grad for p in params]
                 states = [self._get_or_initialize_state(p, algo_name) for p in params]
                 momentums = [s["momentum"] for s in states]
@@ -314,8 +320,8 @@ class NorDion2(Optimizer):
                 # As long as matrix dimensions are not sharded, each device will have whole matrices
                 # Each device already has different matrices of the batch, so we can't parallelize further
                 if is_batch_sharded and not is_matrix_sharded:
-                    for x, g, m, v in zip(
-                        params, gradients, momentums, variances_neuron
+                    for x, g, m, v, n in zip(
+                        params, gradients, momentums, variances_neuron, names
                     ):
                         yield AsyncTask(
                             nordion2_update_batch_async(
@@ -323,6 +329,7 @@ class NorDion2(Optimizer):
                                 G=[g],
                                 M=[m],
                                 V=[v],
+                                names=[n]
                                 shard_dim=None,  # No sharded matrix dim
                                 **nordion2_update_args,
                             )
@@ -335,6 +342,7 @@ class NorDion2(Optimizer):
                             G=pad_batch(gradients, self._world_size),
                             M=pad_batch(momentums, self._world_size),
                             V=pad_batch(variances_neuron, self._world_size),
+                            names=pad_names(names, self._world_size),
                             shard_dim=sharded_tensor_dim,
                             **nordion2_update_args,
                         )
@@ -430,11 +438,13 @@ def nordion2_update_batch_async(
     G: List[Tensor],  # Gradient
     M: List[Tensor],  # Momentum buffer (modified in place)
     V: List[Tensor],  # Variance neuron buffer (modified in place)
+    names: List[str],  # Names of the parameters
     lr: Tensor,  # Learning rate (scalar tensor)
     fraction: float,  # Fraction of submatrix to orthogonalize (0 < fraction <= 1)
     momentum: Tensor,  # Momentum factor (scalar tensor)
     muon_beta2: Tensor,  # Muon beta2 for normalization
     weight_decay: Tensor,  # Weight decay (scalar tensor)
+    k_sel: str,  # How to select submatrix ("topk" or "random")
     epsilon: Tensor,  # Epsilon (scalar tensor)
     nesterov: bool,  # Whether to use Nesterov momentum
     flatten: bool,  # Whether to flatten 3D+ tensors to 2D
@@ -464,6 +474,7 @@ def nordion2_update_batch_async(
         M=to_local(M),
         momentum=momentum,
         nesterov=nesterov,
+        k_sel=k_sel,
     )
 
     # Get one whole matrix for each device to orthogonalize
@@ -582,6 +593,9 @@ def nordion2_update_batch_async(
         raise ValueError(f"Unknown adjust_lr value: {adjust_lr}")
 
     # Update model parameters with orthogonalized output
+    for name, idx in zip(names, indices_list):
+        wandb.log({f"ortho_sel_k/{name}": idx.tolist(),}, commit=False)
+
     dion2_post_orthogonalize(
         X=to_local(X),
         U=U_normed,
@@ -666,8 +680,17 @@ def nordion2_update_pre_orthogonalize(
     assert nesterov == False
 
     M_stacked = torch.stack(M, dim=0)
-    slice_norms = M_stacked.norm(p=1, dim=-1)
-    _, indices = torch.topk(slice_norms, k, dim=-1, sorted=False)
+
+    if k_sel == "topk":
+        slice_norms = M_stacked.norm(p=1, dim=-1)
+        scores = slice_norms
+    elif k_sel == "random":
+        batch_size = M_stacked.size(0)
+        scores = torch.rand(batch_size, device=M_stacked.device)
+    else:
+        raise ValueError(f"Unknown k_sel value: {k_sel}")
+
+    _, indices = torch.topk(scores, k, dim=-1, sorted=False)
     
     # Selecting rows
     num_cols = M[0].size(-1)

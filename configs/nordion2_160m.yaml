@@ -40,3 +40,4 @@ lr: 0.02
 mu: 0.95
 weight_decay: 0.01
 ortho_fraction: 0.5
+k_sel: topk
