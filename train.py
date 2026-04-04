@@ -29,6 +29,7 @@ from dion import Muon
 from dion import MuonReference
 from dion import Dion2
 from dion import NorMuon
+from dion import NorDion2
 
 
 @dataclass
