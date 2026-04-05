@@ -9,6 +9,10 @@ CONFIG="$1"; shift
 GPUS="$1"; shift
 # Remaining args are extra flags for train.py (e.g. --no_wandb true)
 
+echo "[cluster_entry] Fixing triton for torch 2.10 compatibility..."
+pip install --force-reinstall 'pytorch-triton==3.3.1+cf34004b8a' --index-url https://download.pytorch.org/whl/nightly/cu128 2>&1 | tail -3 || \
+  pip install --force-reinstall 'triton==3.3.1' 2>&1 | tail -3 || true
+
 echo "[cluster_entry] Downloading FineWeb data..."
 pip install huggingface-hub 2>/dev/null
 python -c "

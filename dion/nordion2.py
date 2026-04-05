@@ -702,6 +702,7 @@ def nordion2_pre_orthogonalize(
         raise ValueError(f"Unknown k_sel value: {k_sel}")
 
     _, indices = torch.topk(scores, k, dim=-1, sorted=False)
+    indices, _ = indices.sort(dim=-1) #Very necessary for some reason
     
     # Selecting rows
     num_cols = M[0].size(-1)
