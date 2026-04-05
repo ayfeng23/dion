@@ -222,8 +222,16 @@ class NorDion2(Optimizer):
                 p.ndim >= 2 for p in group["params"]
             ), "NorDion2 optimizer only supports matrix parameters."
 
-            group_params = [p for p in group["params"] if p.grad is not None]
-            if not group_params:
+            if "param_names" in group:
+                group_items = [
+                    (p, n)
+                    for p, n in zip(group["params"], group["param_names"])
+                    if p.grad is not None
+                ]
+            else:
+                group_items = [(p, "<unnamed>") for p in group["params"] if p.grad is not None]
+
+            if not group_items:
                 continue
 
             # Wrap hyperparameters in tensors for torch.compile
@@ -329,7 +337,7 @@ class NorDion2(Optimizer):
                                 G=[g],
                                 M=[m],
                                 V=[v],
-                                names=[n]
+                                names=[n],
                                 shard_dim=None,  # No sharded matrix dim
                                 **nordion2_update_args,
                             )
@@ -469,9 +477,10 @@ def nordion2_update_batch_async(
     select_dim = -2
 
     # Update momentum and compute the inputs for orthogonalization
-    U_selected, indices_list = nordion2_update_pre_orthogonalize(
+    U_selected, indices_list = nordion2_pre_orthogonalize(
         G=to_local(G),
         M=to_local(M),
+        fraction=fraction,
         momentum=momentum,
         nesterov=nesterov,
         k_sel=k_sel,
@@ -573,7 +582,7 @@ def nordion2_update_batch_async(
 
     U_normed, V_sel = nordion2_normalization(
         U_ortho,
-        V=V_sel,
+        V_sel=V_sel,
         muon_beta2=muon_beta2,
     )
     
@@ -593,8 +602,9 @@ def nordion2_update_batch_async(
         raise ValueError(f"Unknown adjust_lr value: {adjust_lr}")
 
     # Update model parameters with orthogonalized output
-    for name, idx in zip(names, indices_list):
-        wandb.log({f"ortho_sel_k/{name}": idx.tolist(),}, commit=False)
+    if wandb.run is not None:
+        for name, idx in zip(names, indices_list):
+            wandb.log({f"ortho_sel_k/{name}": idx.tolist(),}, commit=False)
 
     dion2_post_orthogonalize(
         X=to_local(X),
@@ -654,11 +664,13 @@ def nordion2_normalization(
 
     return normalized_U, V_sel
 
-def nordion2_update_pre_orthogonalize(
+def nordion2_pre_orthogonalize(
     G: List[Tensor],
     M: List[Tensor],
+    fraction: float,
     momentum: Tensor,
     nesterov: bool,
+    k_sel: str,
 ) -> List[Tensor]:
     """
     Update momentum with gradient and compute the input to orthogonalization.
@@ -667,8 +679,6 @@ def nordion2_update_pre_orthogonalize(
     """
     dtype = M[0].dtype
 
-    # norm_dim is the dimension we compute norm over
-    # select_dim is the dimension we select submatrix from
     num_select = M[0].size(-2)
     k = max(1, int(math.ceil(fraction * num_select)))
 
@@ -686,7 +696,8 @@ def nordion2_update_pre_orthogonalize(
         scores = slice_norms
     elif k_sel == "random":
         batch_size = M_stacked.size(0)
-        scores = torch.rand(batch_size, device=M_stacked.device)
+        num_rows = M_stacked.size(1)
+        scores = torch.rand(batch_size, num_rows, device=M_stacked.device)
     else:
         raise ValueError(f"Unknown k_sel value: {k_sel}")
 
@@ -700,7 +711,7 @@ def nordion2_update_pre_orthogonalize(
 
     indices_list = list(indices.unbind(dim=0))
     for m, idx in zip(M, indices_list):
-        selected_slice = m.index_select(dim=select_dim, index=idx)
-        m.index_copy_(dim=select_dim, index=idx, source=selected_slice * momentum)
+        selected_slice = m.index_select(dim=-2, index=idx)
+        m.index_copy_(dim=-2, index=idx, source=selected_slice * momentum)
 
     return U_selected, indices_list
