@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.distributed as dist
 from collections import defaultdict
@@ -8,10 +9,14 @@ from torch.distributed.tensor import DeviceMesh, DTensor
 from torch.optim.optimizer import Optimizer, ParamsT
 from typing import Callable, Generator, List, Optional, Union
 
-from .newton_schulz_triton import newton_schulz_triton, zeropower_via_newtonschulz5
+from .newton_schulz_triton import (
+    TRITON_AVAILABLE,
+    newton_schulz_triton,
+    zeropower_via_newtonschulz5,
+)
+from .polar_express import polar_express, polar_express_triton
 from .opt_utils import AsyncRuntime, AsyncTask, to_local
 from .scalar_opts import adamw_update_foreach_async, lion_update_foreach_async
-from .muon import muon_update_newton_schulz, adjust_lr_spectral_norm, adjust_lr_rms_norm
 
 
 class DistributedOrthoBase(Optimizer):
@@ -29,7 +34,9 @@ class DistributedOrthoBase(Optimizer):
         distributed_mesh: Optional[Union[DeviceMesh, ProcessGroup]],
         algo_name: str,
         defaults: dict,
+        use_gram_newton_schulz: bool = False,
         use_triton: bool = False,
+        use_polar_express: bool = False,
         newton_schulz_func: Optional[Callable] = None,
     ):
         super().__init__(params, defaults)
@@ -60,14 +67,34 @@ class DistributedOrthoBase(Optimizer):
             )
         self._distributed_mesh = distributed_mesh
 
-        # Newton-Schulz configuration
+        # Orthogonalization function configuration
         if newton_schulz_func is not None:
             if not callable(newton_schulz_func):
                 raise TypeError(
                     f"newton_schulz_func must be a callable function, got {type(newton_schulz_func)}"
                 )
             self._newton_schulz_func = newton_schulz_func
+        elif use_gram_newton_schulz:
+            from gram_newton_schulz import GramNewtonSchulz
+            use_polar_express = True
+            _gns = GramNewtonSchulz(
+                ns_use_kernels=use_triton,
+                use_gram_newton_schulz=True,
+                gram_newton_schulz_reset_iterations=[2],
+                # Some compiler crashes were observed with mode="reduce-overhead" when we also compile the entire optimizer step.
+                compile_kwargs=dict(fullgraph=True, mode="default"),
+            )
+            self._newton_schulz_func = lambda X, epsilon=None: _gns(X)
+        elif use_polar_express and use_triton:
+            self._newton_schulz_func = polar_express_triton
+        elif use_polar_express:
+            self._newton_schulz_func = polar_express
         elif use_triton:
+            if not TRITON_AVAILABLE:
+                raise ImportError(
+                    "use_triton=True requires the 'triton' package, which is not installed. "
+                    "Install it with: pip install dion[triton]  (or: pip install triton)"
+                )
             self._newton_schulz_func = newton_schulz_triton
         else:
             self._newton_schulz_func = zeropower_via_newtonschulz5
@@ -260,7 +287,7 @@ def megabatch_orthogonalize_async(
     N = len(U)
 
     # Pad to divisible by world_size (needed by both distributed paths)
-    if process_group is not None and N > 1:
+    if process_group is not None and (N > 1 or comm_dim is not None):
         pad_n = (world_size - N % world_size) % world_size
         U_work = U + [torch.zeros_like(U[0])] * pad_n if pad_n > 0 else U
         N_total = len(U_work)
@@ -347,3 +374,42 @@ def megabatch_orthogonalize_async(
             epsilon=epsilon,
         )
         return [stacked[i] for i in range(N)]
+
+
+def muon_update_newton_schulz(
+    X: Tensor,
+    newton_schulz_func: Callable,
+    flatten: bool,
+    epsilon: Tensor,
+) -> Tensor:
+    """
+    Flatten the input tensor if needed and call the Newton-Schulz function.
+    """
+    original_shape = X.shape
+    if flatten and X.ndim >= 3:
+        X = X.flatten(start_dim=1)
+    elif X.ndim >= 4:
+        X = X.flatten(end_dim=-3)
+
+    return newton_schulz_func(X, epsilon=epsilon).reshape(original_shape)
+
+
+def adjust_lr_rms_norm(lr, param_shape, flatten):
+    """Adjust learning rate for constant element-wise RMS norm."""
+    if flatten:
+        fan_out = param_shape[0]
+        fan_in = math.prod(param_shape[1:])
+    else:
+        fan_out, fan_in = param_shape[-2:]
+    adjusted_ratio = 0.2 * math.sqrt(max(fan_out, fan_in))
+    return lr * adjusted_ratio
+
+
+def adjust_lr_spectral_norm(lr, param_shape, flatten):
+    """Adjust from spectral norm 1 to RMS operator norm 1."""
+    if flatten:
+        fan_out = param_shape[0]
+        fan_in = math.prod(param_shape[1:])
+    else:
+        fan_out, fan_in = param_shape[-2:]
+    return lr * math.sqrt(fan_out / fan_in)
