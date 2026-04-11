@@ -13,7 +13,7 @@ from .megabatch_base import (
     adjust_lr_rms_norm,
 )
 from .opt_utils import AsyncTask, to_local
-from .muon import muon_update_post_orthogonalize
+from .muon import muon_update_pre_orthogonalize, muon_update_post_orthogonalize
 
 
 class NorMuon(DistributedOrthoBase):
@@ -295,31 +295,3 @@ def normuon_normalization_stacked(
     normalized_U = normalized_U * (norm_U / norm_U_new)
 
     return normalized_U, V
-
-def muon_update_pre_orthogonalize(
-    G: List[Tensor],
-    M: List[Tensor],
-    momentum: Tensor,
-    nesterov: bool,
-) -> List[Tensor]:
-    """
-    Update momentum with gradient and compute the input to orthogonalization.
-    Inputs and outputs should be lists of regular Tensor, not DTensor.
-    This is a separate function for compatibility with torch.compile().
-    """
-    dtype = M[0].dtype
-    G = [g.to(dtype=dtype) for g in G]
-
-    # Update momentum with new gradient
-    torch._foreach_add_(M, G)
-    # print(nesterov)
-    assert nesterov == False
-    U = M
-    
-    # delay momentum update to match dion2
-    torch._foreach_mul_(M, momentum)
-
-    # Convert to bfloat16 before communication
-    U = [u.to(dtype=torch.bfloat16) for u in U]
-
-    return U
