@@ -1,5 +1,8 @@
+import math
 import torch
 from collections import defaultdict
+import torch.distributed as dist
+import wandb
 from torch import Tensor
 from torch.distributed import ProcessGroup
 from torch.distributed.tensor import DeviceMesh, DTensor
@@ -12,22 +15,29 @@ from .megabatch_base import (
     adjust_lr_spectral_norm,
     adjust_lr_rms_norm,
 )
-from .opt_utils import AsyncTask, to_local
-from .muon import muon_update_pre_orthogonalize, muon_update_post_orthogonalize
+
+from .opt_utils import (
+    AsyncTask,
+    create_named_batches,
+    pad_names,
+    to_local,
+)
+from .dion2 import dion2_post_orthogonalize
 
 
-class NorMuon(DistributedOrthoBase):
+class NorDion2(DistributedOrthoBase):
     """
-    Distributed NorMuon optimizer for PyTorch FSDP2. Also compatible with DDP.
+    Distributed NorDion2 optimizer for PyTorch FSDP2. Also compatible with DDP.
 
     Args:
         params: Parameters for the optimizer.
         distributed_mesh: DeviceMesh or ProcessGroup for distributed training.
             Use DeviceMesh for FSDP2 and ProcessGroup for DistributedDataParallel.
-        lr: Base learning rate. For NorMuon, this will be scaled based on the matrix dimensions.
+        lr: Base learning rate. For NorDion2, this will be scaled based on the matrix dimensions.
             For element-wise update rules, this is the actual learning rate and no additional scaling is done.
-        mu: Momentum factor for NorMuon algorithm.
-        muon_beta2: Second beta parameter for NorMuon algorithm's adaptive updates.
+        fraction: Fraction of submatrix to orthogonalize per update (0 < fraction <= 1).
+        mu: Momentum factor for NorDion2 algorithm.
+        muon_beta2: Second beta parameter for NorDion2 algorithm's adaptive updates.
         betas: Tuple of (beta1, beta2) for AdamW and Lion algorithms.
         weight_decay: Weight decay factor.
         cautious_wd: Whether to apply weight decay only where update and parameter signs align.
@@ -47,7 +57,7 @@ class NorMuon(DistributedOrthoBase):
 
     Muon optimizer algorithm by Keller Jordan: https://kellerjordan.github.io/posts/muon/
     FSDP2 Muon uses all-to-all communications: https://www.essential.ai/blog/infra
-    NorMuon optimizer: https://arxiv.org/abs/2510.05491
+    NorDion2 optimizer: https://arxiv.org/abs/2510.05491
     """
 
     def __init__(
@@ -55,10 +65,12 @@ class NorMuon(DistributedOrthoBase):
         params: ParamsT,
         distributed_mesh: Optional[Union[DeviceMesh, ProcessGroup]] = None,
         lr: float = 0.01,
+        fraction: float = 0.25,
         mu: float = 0.95,
         muon_beta2: float = 0.95,
         betas: Tuple[float, float] = (0.9, 0.95),
         weight_decay: float = 0.01,
+        k_sel: str = "topk",
         cautious_wd: bool = False,
         epsilon: float = 1e-8,
         nesterov: bool = False,
@@ -84,21 +96,23 @@ class NorMuon(DistributedOrthoBase):
 
         defaults = dict(
             lr=lr,
+            fraction=fraction,
             mu=mu,
             muon_beta2=muon_beta2,
             beta1=betas[0],
             beta2=betas[1],
             weight_decay=weight_decay,
             cautious_wd=cautious_wd,
-            algorithm="normuon",
+            algorithm="nordion2",
             step=0,
             epsilon=epsilon,
             nesterov=nesterov,
             flatten=flatten,
             adjust_lr=adjust_lr,
+            k_sel=k_sel,
         )
         super().__init__(
-            params, distributed_mesh, "normuon", defaults,
+            params, distributed_mesh, "nordion2", defaults,
             use_gram_newton_schulz=use_gram_newton_schulz,
             use_triton=use_triton,
             use_polar_express=use_polar_express,
@@ -116,7 +130,7 @@ class NorMuon(DistributedOrthoBase):
         _, is_matrix_sharded, sharded_tensor_dim = result
         if is_matrix_sharded and sharded_tensor_dim == param.ndim - 1:
             raise NotImplementedError(
-                "NorMuon currently does not support parameters sharded along the last dimension. "
+                "NorDion2 currently does not support parameters sharded along the last dimension. "
                 "Please avoid shards at dim -1."
             )
         return result
@@ -125,24 +139,34 @@ class NorMuon(DistributedOrthoBase):
         self, param_groups: List[dict]
     ) -> Generator["AsyncTask", None, None]:
         """
-        Mega-batched NorMuon task creation: groups ALL same-shape parameters
+        Mega-batched NorDion2 task creation: groups ALL same-shape parameters
         into a single task to minimize communication rounds and kernel launches.
         """
         for group in param_groups:
             assert group["algorithm"] == self._algo_name
             assert all(
                 p.ndim >= 2 for p in group["params"]
-            ), "NorMuon optimizer only supports matrix parameters."
+            ), "NorDion2 optimizer only supports matrix parameters."
 
-            group_params = [p for p in group["params"] if p.grad is not None]
-            if not group_params:
+            if "param_names" in group:
+                group_items = [
+                    (p, n)
+                    for p, n in zip(group["params"], group["param_names"])
+                    if p.grad is not None
+                ]
+            else:
+                group_items = [(p, "<unnamed>") for p in group["params"] if p.grad is not None]
+
+            if not group_items:
                 continue
 
             update_args = dict(
                 lr=torch.tensor(group["lr"]),
+                fraction=group["fraction"],
                 momentum=torch.tensor(group["mu"]),
                 muon_beta2=torch.tensor(group["muon_beta2"]),
                 weight_decay=torch.tensor(group["weight_decay"]),
+                k_sel=group["k_sel"],
                 epsilon=torch.tensor(group["epsilon"]),
                 nesterov=group["nesterov"],
                 flatten=group["flatten"],
@@ -155,11 +179,13 @@ class NorMuon(DistributedOrthoBase):
             )
 
             shape_groups: dict[tuple, list] = defaultdict(list)
-            for p in group_params:
+            for p, name in group_items:
                 sharding = p.placements if isinstance(p, DTensor) else None
-                shape_groups[(p.shape, sharding, p.dtype)].append(p)
+                shape_groups[(p.shape, sharding, p.dtype)].append((p, name))
 
-            for (_shape, _sharding, _dtype), params in shape_groups.items():
+            for (_shape, _sharding, _dtype), items in shape_groups.items():
+                params = [p for p, _ in items]
+                names  = [n for _, n in items]
                 gradients = [p.grad for p in params]
                 states = [self._get_or_initialize_state(p, self._algo_name) for p in params]
                 momentums = [s["momentum"] for s in states]
@@ -174,26 +200,30 @@ class NorMuon(DistributedOrthoBase):
                     megabatch_args = {**update_args, "process_group": None}
 
                 yield AsyncTask(
-                    normuon_update_megabatch_async(
+                    nordion2_update_megabatch_async(
                         X=params,
                         G=gradients,
                         M=momentums,
                         V=variances_neuron,
+                        names=names,
                         shard_dim=sharded_tensor_dim,
                         **megabatch_args,
                     )
                 )
 
 
-def normuon_update_megabatch_async(
+def nordion2_update_megabatch_async(
     X: List[Tensor],
     G: List[Tensor],
     M: List[Tensor],
     V: List[Tensor],
+    names: List[str], 
     lr: Tensor,
+    fraction: float,
     momentum: Tensor,
     muon_beta2: Tensor,
     weight_decay: Tensor,
+    k_sel: str,  # How to select submatrix ("topk" or "random")
     epsilon: Tensor,
     nesterov: bool,
     flatten: bool,
@@ -206,15 +236,23 @@ def normuon_update_megabatch_async(
     cautious_wd: bool = False,
 ) -> Generator[None, None, None]:
     """
-    Mega-batched NorMuon update: processes ALL same-shape parameters in one
+    Mega-batched NorDion2 update: processes ALL same-shape parameters in one
     communication round instead of world_size-sized batches.
     """
     N = len(X)
     assert N == len(G) == len(M) == len(V)
 
-    # Pre-orthogonalize: update momentum
-    U = muon_update_pre_orthogonalize(
-        G=to_local(G), M=to_local(M), momentum=momentum, nesterov=nesterov,
+    # Choose Neurons
+    select_dim = -2
+
+    # Update momentum and compute the inputs for orthogonalization
+    U_selected, indices_list = nordion2_pre_orthogonalize(
+        G=to_local(G),
+        M=to_local(M),
+        fraction=fraction,
+        momentum=momentum,
+        nesterov=nesterov,
+        k_sel=k_sel,
     )
 
     # Convert shard_dim to negative for comm_dim
@@ -232,14 +270,22 @@ def normuon_update_megabatch_async(
         epsilon=epsilon,
     )
 
-    # NorMuon normalization using stacked tensors for fewer kernel launches
-    V_local = to_local(V)
-    U_stacked = torch.stack(U)
-    V_stacked = torch.stack(V_local)
-    U_stacked, V_stacked = normuon_normalization_stacked(U_stacked, V_stacked, muon_beta2)
-    for i in range(N):
-        V_local[i].copy_(V_stacked[i])
-    U = [U_stacked[i] for i in range(N)]
+    # NorDion2 normalization
+    # Select V for each top-k row
+    V_sel = []
+    for v, indices in zip(V, indices_list):
+        selected_v = v.index_select(dim=select_dim, index=indices)
+        V_sel.append(selected_v)
+
+    U_normed, V_sel = nordion2_normalization(
+        U_ortho,
+        V_sel=V_sel,
+        muon_beta2=muon_beta2,
+    )
+    
+    # Copy back update V_sel to V using indices
+    for v, v_sel, indices in zip(V, V_sel, indices_list):
+        v.index_copy_(dim=select_dim, index=indices, source=v_sel)
 
     # Compute scaled learning rate
     if adjust_lr is None:
@@ -251,47 +297,118 @@ def normuon_update_megabatch_async(
     else:
         raise ValueError(f"Unknown adjust_lr value: {adjust_lr}")
 
-    # Post-orthogonalize: apply update
-    muon_update_post_orthogonalize(
+    # Update model parameters with orthogonalized output
+    if wandb.run is not None:
+        for name, idx in zip(names, indices_list):
+            wandb.log({f"ortho_sel_k/{name}": idx.tolist(),}, commit=False)
+
+    dion2_post_orthogonalize(
         X=to_local(X),
-        U=U,
+        U=U_normed,
+        indices=indices_list,
         base_lr=lr,
         adjusted_lr=adjusted_lr,
         weight_decay=weight_decay,
-        cautious_wd=cautious_wd,
+        select_dim=-2,
     )
 
 
 @torch.compile(fullgraph=True)
-def normuon_normalization_stacked(
-    U: Tensor,  # [N, rows, cols]
-    V: Tensor,  # [N, rows, 1]  (variance neuron buffer)
+def nordion2_normalization(
+    U_ortho: List[Tensor],
+    V_sel: List[Tensor],
     muon_beta2: Tensor,
-) -> Tuple[Tensor, Tensor]:
+) -> Tuple[List[Tensor], List[Tensor]]:
     """
-    NorMuon normalization on stacked 3D tensors for minimal kernel launches.
-    Equivalent to normuon_normalization but operates on a single stacked tensor
-    instead of a list, reducing per-element kernel overhead.
-    Returns (normalized_U, updated_V).
+    NorDion2 normalization step after orthogonalization.
+    Inputs and outputs should be lists of regular Tensor, not DTensor.
+    This is a separate function for compatibility with torch.compile().
     """
-    V_dtype = V.dtype
-    U = U.to(dtype=V_dtype)
+    V_dtype = V_sel[0].dtype
+    U_ortho = [u.to(dtype=V_dtype) for u in U_ortho]
+    
+    norm_U = [
+        u.norm(p=2, dim=(-2, -1), keepdim=True) for u in U_ortho
+    ]  # list of ||u||_F, shape [*, 1, 1]
 
-    # Frobenius norm per matrix: [N, 1, 1]
-    norm_U = U.norm(p=2, dim=(-2, -1), keepdim=True)
+    U_sq = torch._foreach_mul(U_ortho, U_ortho)  # list of u*u, same shapes as U_ortho
+    neuron_norms = [u_sq.mean(dim=-1, keepdim=True) for u_sq in U_sq]  # Shape: [*, rows, 1]
+    
+    torch._foreach_lerp_(
+        V_sel, neuron_norms, 1 - muon_beta2
+    )  # Update variance neuron buffer
 
-    # Neuron-wise variance: mean of squares along last dim -> [N, rows, 1]
-    neuron_norms = (U * U).mean(dim=-1, keepdim=True)
+    denom = torch._foreach_sqrt(V_sel)  # list of sqrt(v)
+    torch._foreach_add_(denom, 1e-8)  # denom[i] += 1e-8
+    normalized_U = torch._foreach_div(U_ortho, denom)  # list of u / denom
 
-    # Update variance buffer (EMA)
-    V = torch.lerp(V, neuron_norms, 1 - muon_beta2)
+    norm_U_new = [
+        nu.norm(p=2, dim=(-2, -1), keepdim=True) for nu in normalized_U
+    ]  # list of ||normalized_u||_F, shape [*, 1, 1]
+    
+    # Protect against division by zero when norm_U_new is zero.
+    # This can happen when U is all zeros (e.g., zero gradients from zero-initialized weights).
+    # In this case, norm_U is also zero, so after clamping norm_U_new to ε the ratio becomes 0/ε ≈ 0,
+    # and normalized_U * ratio correctly remains zero, preserving the zero state.
+    norm_U_new_safe = [nu.clamp(min=1e-8) for nu in norm_U_new]
+    
+    ratio = torch._foreach_div(
+        norm_U, norm_U_new_safe
+    )  # list of ||u||_F / ||normalized_u||_F, shape [*, 1, 1]
+    
+    torch._foreach_mul_(normalized_U, ratio)  # normalized_u[i] *= ratio
 
-    # Normalize
-    denom = V.sqrt() + 1e-8
-    normalized_U = U / denom
+    return normalized_U, V_sel
 
-    # Rescale to preserve Frobenius norm
-    norm_U_new = normalized_U.norm(p=2, dim=(-2, -1), keepdim=True).clamp(min=1e-8)
-    normalized_U = normalized_U * (norm_U / norm_U_new)
+def nordion2_pre_orthogonalize(
+    G: List[Tensor],
+    M: List[Tensor],
+    fraction: float,
+    momentum: Tensor,
+    nesterov: bool,
+    k_sel: str,
+) -> List[Tensor]:
+    """
+    Update momentum with gradient and compute the input to orthogonalization.
+    Inputs and outputs should be lists of regular Tensor, not DTensor.
+    This is a separate function for compatibility with torch.compile().
+    """
+    dtype = M[0].dtype
 
-    return normalized_U, V
+    num_select = M[0].size(-2)
+    k = max(1, int(math.ceil(fraction * num_select)))
+
+    G = [g.to(dtype=dtype) for g in G]
+
+    # Update momentum with new gradient
+    torch._foreach_add_(M, G)
+    # print(nesterov)
+    assert nesterov == False
+
+    M_stacked = torch.stack(M, dim=0)
+
+    if k_sel == "topk":
+        slice_norms = M_stacked.norm(p=1, dim=-1)
+        scores = slice_norms
+    elif k_sel == "random":
+        batch_size = M_stacked.size(0)
+        num_rows = M_stacked.size(1)
+        scores = torch.rand(batch_size, num_rows, device=M_stacked.device)
+    else:
+        raise ValueError(f"Unknown k_sel value: {k_sel}")
+
+    _, indices = torch.topk(scores, k, dim=-1, sorted=False)
+    indices, _ = indices.sort(dim=-1) #Very necessary for some reason
+    
+    # Selecting rows
+    num_cols = M[0].size(-1)
+    indices_expanded = indices.unsqueeze(-1).expand(-1, -1, num_cols)
+    selected_stacked = torch.gather(M_stacked, dim=-2, index=indices_expanded)
+    U_selected = list(selected_stacked.to(dtype=torch.bfloat16).unbind(dim=0))
+
+    indices_list = list(indices.unbind(dim=0))
+    for m, idx in zip(M, indices_list):
+        selected_slice = m.index_select(dim=-2, index=idx)
+        m.index_copy_(dim=-2, index=idx, source=selected_slice * momentum)
+
+    return U_selected, indices_list
