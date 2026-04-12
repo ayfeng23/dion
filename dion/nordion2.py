@@ -259,8 +259,8 @@ def nordion2_update_megabatch_async(
     comm_dim = (shard_dim - X[0].ndim) if shard_dim is not None else None
 
     # Orthogonalize via shared megabatch communication
-    U = yield from megabatch_orthogonalize_async(
-        U,
+    U_ortho = yield from megabatch_orthogonalize_async(
+        U_selected,
         comm_dim=comm_dim,
         device_rank=device_rank,
         world_size=world_size,
