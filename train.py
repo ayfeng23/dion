@@ -64,6 +64,8 @@ class Hyperparameters:
     lr: float = 0.02
     mu: float = 0.95
     weight_decay: float = 0.01
+    omega: float = 0.01
+    wd_time_scale_ratio: float = 0.1
     ortho_fraction: float = 0.25
 
     # Optimizer specific hyperparameters
@@ -140,6 +142,8 @@ def parse_cli_args():
     )
     parser.add_argument("--mu", type=float, default=None, help="Momentum coefficient")
     parser.add_argument("--weight_decay", type=float, default=None, help="Weight decay")
+    parser.add_argument("--omega", type=float, default=None, help="Weight decay omega parameter")
+    parser.add_argument("--wd_time_scale_ratio", type=float, default=None, help="Weight decay time scale ratio")
     parser.add_argument(
         "--time_optimizer", action="store_true",
         help="Time fwd/bwd and optimizer step separately (adds cuda.synchronize between them)",
@@ -813,6 +817,10 @@ def main():
         cli_args=cli_args,
     )
 
+    # Tag each param group with its initial weight_decay for scheduling
+    for group in optimizer.param_groups:
+        group["initial_weight_decay"] = group["weight_decay"]
+
     # Learning rate scheduler
     def get_lr(it):
         warmup_iters = round(hp.warmup_ratio * hp.num_iterations)
@@ -1012,6 +1020,19 @@ def main():
         grad_norm = torch.nn.utils.get_total_norm(
             [p.grad for p in model.parameters() if p.grad is not None]
         )
+        # Parameter norm
+        param_norm = torch.nn.utils.get_total_norm(
+            [p for p in model.parameters()]
+        )
+
+        # Update weight_decay before optimizer step so it uses the scheduled value
+        cur_lr_ratio = get_lr(step)
+        wd_time_scale = max(hp.num_iterations * hp.wd_time_scale_ratio, 1.0)
+        new_wd = hp.omega / wd_time_scale / (1.0 + step / wd_time_scale) * cur_lr_ratio
+        for group in optimizer.param_groups:
+            if group.get("initial_weight_decay", 0) > 0:
+                group["weight_decay"] = new_wd
+
         optimizer.step()
         lr_scheduler.step()
         model.zero_grad(set_to_none=True)
@@ -1028,6 +1049,7 @@ def main():
             log_dict = {
                 "train/loss": train_loss.item(),
                 "train/grad_norm": grad_norm.item(),
+                "train/param_norm": param_norm.item(),
                 "step": step,
                 "time/training_time_ms": current_training_time_ms,
             }
@@ -1037,7 +1059,7 @@ def main():
             wandb.log(log_dict)
         if MASTER_PROCESS and cli_args.debug:
             print0(
-                f"Step {step}: train_loss={train_loss.item():.4f}, grad_norm={grad_norm.item():.4f}"
+                f"Step {step}: train_loss={train_loss.item():.4f}, grad_norm={grad_norm.item():.4f}, param_norm={param_norm.item():.4f}"
             )
         pbar.update(1)
         pbar.set_postfix(train_loss=f"{train_loss.item():.4f}")

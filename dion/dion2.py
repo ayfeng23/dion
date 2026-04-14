@@ -333,8 +333,6 @@ def dion2_post_orthogonalize(
     Inputs and outputs should be lists of regular Tensor, not DTensor.
     This is a separate function for compatibility with torch.compile().
     """
-    torch._foreach_mul_(X, 1 - base_lr * weight_decay)
-
     # Convert U to match parameter dtype
     dtype = X[0].dtype
     U = [u.to(dtype=dtype) for u in U]
@@ -343,6 +341,9 @@ def dion2_post_orthogonalize(
     U_scaled = [neg_lr * u for u in U]
     for x, u_scaled, idx in zip(X, U_scaled, indices):
         x.index_add_(dim=select_dim, index=idx, source=u_scaled)
+
+    # ADana style weight decay (applied after update, without base_lr multiplier)
+    torch._foreach_mul_(X, 1 - weight_decay)
 
 
 # A helper function to print selection choice for each matrix
