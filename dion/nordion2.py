@@ -2,7 +2,10 @@ import math
 import torch
 from collections import defaultdict
 import torch.distributed as dist
-import wandb
+try:
+    import wandb
+except ImportError:
+    wandb = None
 from torch import Tensor
 from torch.distributed import ProcessGroup
 from torch.distributed.tensor import DeviceMesh, DTensor
@@ -298,7 +301,7 @@ def nordion2_update_megabatch_async(
         raise ValueError(f"Unknown adjust_lr value: {adjust_lr}")
 
     # Update model parameters with orthogonalized output
-    if wandb.run is not None:
+    if wandb is not None and wandb.run is not None:
         for name, idx in zip(names, indices_list):
             wandb.log({f"ortho_sel_k/{name}": idx.tolist(),}, commit=False)
 
