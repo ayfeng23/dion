@@ -275,8 +275,9 @@ def nordion2_update_megabatch_async(
 
     # NorDion2 normalization
     # Select V for each top-k row
+    V_local = to_local(V)
     V_sel = []
-    for v, indices in zip(V, indices_list):
+    for v, indices in zip(V_local, indices_list):
         selected_v = v.index_select(dim=select_dim, index=indices)
         V_sel.append(selected_v)
 
@@ -287,7 +288,7 @@ def nordion2_update_megabatch_async(
     )
     
     # Copy back update V_sel to V using indices
-    for v, v_sel, indices in zip(V, V_sel, indices_list):
+    for v, v_sel, indices in zip(V_local, V_sel, indices_list):
         v.index_copy_(dim=select_dim, index=indices, source=v_sel)
 
     # Compute scaled learning rate
