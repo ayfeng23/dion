@@ -30,6 +30,7 @@ from dion import MuonReference
 from dion import Dion2
 from dion import NorMuon
 from dion import NorDion2
+from dion import NorDion2Old
 
 
 @dataclass
@@ -541,6 +542,38 @@ def init_optimizer(
         print0(f"Triton Newton-Schulz kernels: {not cli_args.no_triton}")
         print0(f"Distributed NorDion2 using: {comm_method}")
         opt = NorDion2(
+            param_groups,
+            distributed_mesh=distributed_mesh,
+            lr=hp.lr,
+            fraction=hp.ortho_fraction,
+            mu=hp.mu,
+            muon_beta2=0.95,
+            weight_decay=hp.weight_decay,
+            k_sel=hp.k_sel,
+            nesterov=False,
+            adjust_lr=hp.adjust_lr,
+            use_gram_newton_schulz=cli_args.use_gram_newton_schulz,
+            use_triton=(not cli_args.no_triton),
+            use_polar_express=cli_args.use_polar_express,
+        )
+
+    elif hp.optimizer == "nordion2old":
+        if device_mesh is not None:
+            # Ensure that we have a supported device mesh configuration for NorDion2Old
+            if inner_shard_mesh is not None and inner_shard_mesh.size() > 1:
+                raise ValueError("Tensor parallel is not supported by NorDion2Old.")
+            distributed_mesh = (
+                outer_shard_mesh if outer_shard_mesh.size() > 1 else replicate_mesh
+            )
+            comm_method = "all-to-all" if outer_shard_mesh.size() > 1 else "all-gather"
+        else:
+            assert ddp_model is not None
+            distributed_mesh = ddp_model.process_group  # using ProcessGroup for DDP
+            comm_method = "all-gather"
+        print0(f"NorDion2Old LR adjust method: {hp.adjust_lr}")
+        print0(f"Triton Newton-Schulz kernels: {not cli_args.no_triton}")
+        print0(f"Distributed NorDion2Old using: {comm_method}")
+        opt = NorDion2Old(
             param_groups,
             distributed_mesh=distributed_mesh,
             lr=hp.lr,
