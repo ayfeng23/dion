@@ -335,14 +335,13 @@ def dion2_post_orthogonalize(
     """
     torch._foreach_mul_(X, 1 - base_lr * weight_decay)
 
-    # Convert U to match parameter dtype
-    dtype = X[0].dtype
-    U = [u.to(dtype=dtype) for u in U]
-    # Apply weight update
+    # Apply weight update in float32 to match normuon's foreach_sub_ precision.
+    # index_add_ requires matching dtypes, so upcast X temporarily.
     neg_lr = -adjusted_lr
-    U_scaled = [neg_lr * u for u in U]
-    for x, u_scaled, idx in zip(X, U_scaled, indices):
-        x.index_add_(dim=select_dim, index=idx, source=u_scaled)
+    for x, u, idx in zip(X, U, indices):
+        x_f32 = x.float()
+        x_f32.index_add_(dim=select_dim, index=idx, source=neg_lr * u.float())
+        x.copy_(x_f32.to(x.dtype))
 
 
 # A helper function to print selection choice for each matrix
