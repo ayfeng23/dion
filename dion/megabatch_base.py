@@ -7,7 +7,7 @@ from torch import Tensor
 from torch.distributed import ProcessGroup
 from torch.distributed.tensor import DeviceMesh, DTensor
 from torch.optim.optimizer import Optimizer, ParamsT
-from typing import Callable, Generator, List, Optional, Union
+from typing import Callable, Generator, List, Optional, Tuple, Union
 
 from .newton_schulz_triton import (
     TRITON_AVAILABLE,
@@ -149,6 +149,94 @@ class DistributedOrthoBase(Optimizer):
                 state["variance"] = torch.zeros_like(param)
         return state
 
+    def _resolve_num_heads(self, group: dict) -> Optional[int]:
+        """Validate the ``num_heads`` option on a param group.
+
+        Returns the group's ``num_heads`` when it is set and > 1 (the only case
+        that actually triggers the per-head code path). Returns ``None`` when
+        ``num_heads`` is unset or equals 1 (both are no-ops). Raises
+        ``ValueError`` for invalid values or incompatible combinations.
+        """
+        num_heads = group.get("num_heads")
+        if num_heads is None:
+            return None
+        # bool is a subclass of int in Python; reject it explicitly.
+        if isinstance(num_heads, bool) or not isinstance(num_heads, int) or num_heads < 1:
+            raise ValueError(
+                f"num_heads must be a positive integer if set, got {num_heads!r}."
+            )
+        if num_heads == 1:
+            return None
+        if group.get("flatten"):
+            raise ValueError(
+                "num_heads > 1 is incompatible with flatten=True: flattening "
+                "the per-head 3D view collapses heads back into a single 2D "
+                "matrix, defeating per-head Newton-Schulz."
+            )
+        return num_heads
+
+    def _prepare_head_split(
+        self,
+        num_heads: int,
+        params: List[Tensor],
+        *extras: List[Tensor],
+    ) -> Tuple[List[Tensor], ...]:
+        """Reshape 2D params (and same-dim-0 companion tensors) into 3D per-head views.
+
+        A 2D weight of shape ``(num_heads * head_dim, ...)`` is returned as
+        a 3D local tensor of shape ``(num_heads_local, head_dim, ...)``. The same
+        split is applied to any ``extras`` lists (grads, momentums, and NorMuon's
+        per-neuron variance buffer of shape ``(out, 1)``).
+
+        In-place updates on the returned views propagate to the underlying storage.
+        Callers must also mark the resulting tensors as batch-sharded (skip NS
+        all-to-all) since each rank's shard now holds whole heads.
+        """
+        first = params[0]
+        full_shape = first.shape
+        if first.ndim != 2:
+            raise ValueError(
+                f"num_heads is only supported for 2D parameters, got shape {tuple(full_shape)}."
+            )
+        if full_shape[0] % num_heads != 0:
+            raise ValueError(
+                f"num_heads ({num_heads}) must divide dim 0 of the parameter "
+                f"(got shape {tuple(full_shape)})."
+            )
+        head_dim = full_shape[0] // num_heads
+
+        if isinstance(first, DTensor):
+            shard_placements = [
+                (i, p)
+                for i, p in enumerate(first.placements)
+                if p.is_shard() and first.device_mesh.size(i) > 1
+            ]
+            if any(p.dim != 0 for _, p in shard_placements):
+                raise NotImplementedError(
+                    f"num_heads requires sharding on dim 0 (the heads dim) or no sharding; "
+                    f"got placements {first.placements}."
+                )
+            if shard_placements:
+                sharded_mesh_dim = shard_placements[0][0]
+                world = first.device_mesh.size(sharded_mesh_dim)
+                if num_heads % world != 0:
+                    raise ValueError(
+                        f"num_heads ({num_heads}) must be divisible by the sharding "
+                        f"world_size ({world}) so each rank holds whole heads."
+                    )
+
+        def _as_3d(t: Tensor) -> Tensor:
+            local = t.to_local() if isinstance(t, DTensor) else t
+            local_dim0 = local.shape[0]
+            if local_dim0 % head_dim != 0:
+                raise RuntimeError(
+                    f"Local shard dim 0 ({local_dim0}) is not a multiple of head_dim "
+                    f"({head_dim}); shard boundaries must align with heads."
+                )
+            return local.view(local_dim0 // head_dim, head_dim, *local.shape[1:])
+
+        return tuple([_as_3d(t) for t in lst] for lst in (params,) + extras)
+
     def _get_shard_info(self, param: Tensor, group: dict):
         """Determine sharding info. Returns (is_batch_sharded, is_matrix_sharded, sharded_tensor_dim)."""
         is_batch_sharded = False
@@ -270,6 +358,7 @@ def megabatch_orthogonalize_async(
     newton_schulz_func: Callable,
     flatten: bool,
     epsilon: Tensor,
+    global_comm_dim_size: Optional[int],
 ) -> Generator[None, None, List[Tensor]]:
     """
     Shared megabatch communication + Newton-Schulz orthogonalization.
@@ -290,6 +379,12 @@ def megabatch_orthogonalize_async(
         newton_schulz_func: Newton-Schulz orthogonalization function.
         flatten: Whether to flatten 3D+ tensors to 2D.
         epsilon: Small value for numerical stability.
+        global_comm_dim_size: Required (non-None) when ``comm_dim is not
+            None``; pass ``None`` otherwise. The unsharded (global) size
+            along ``comm_dim``, taken from the DTensor's global shape
+            (``param.shape[comm_dim]``). Used to compute
+            ``padded_local_size = ceil(global / world_size)`` so the
+            alltoall sees uniform per-pair sizes across ranks.
     """
     N = len(U)
 
@@ -304,6 +399,44 @@ def megabatch_orthogonalize_async(
 
     if comm_dim is not None and process_group is not None:
         # --- Mega-batched sharded FSDP2 path ---
+
+        # Pad each rank's local shard along comm_dim to a rank-consistent
+        # ``padded_local_size = ceil(global / world_size)`` so dist.all_to_all
+        # sees uniform per-pair sizes. FSDP2 contiguous chunking otherwise
+        # leaves some ranks with empty (numel=0) shards when the sharded
+        # global dim is smaller than world_size or doesn't divide evenly to
+        # fill all ranks (e.g. shape (18, D) over world_size=8: ranks 6 and 7
+        # hold (0, D) shards). Without padding the alltoall has mismatched
+        # per-pair sizes and hangs. Newton-Schulz preserves zero rows (they
+        # contribute nothing to U^T U), so padding doesn't change the
+        # orthogonalization of the real rows.
+        #
+        # NOTE: this assumes FSDP2-style contiguous chunking, where every rank
+        # holds at most ceil(global / world_size) elements along comm_dim. If
+        # FSDP2 ever switches to a non-contiguous strategy (e.g. block-cyclic),
+        # this derivation would be wrong; the size check below catches that.
+        if global_comm_dim_size is None:
+            raise ValueError(
+                "global_comm_dim_size must be passed when comm_dim is not "
+                "None; callers should pass the unsharded DTensor's global "
+                "size along comm_dim."
+            )
+        padded_local_size = (global_comm_dim_size + world_size - 1) // world_size
+        original_local_size = U_work[0].size(comm_dim)
+        if padded_local_size < original_local_size:
+            raise RuntimeError(
+                f"padded_local_size ({padded_local_size}) < this rank's "
+                f"local size ({original_local_size}); FSDP2 contiguous-"
+                f"chunking assumption violated (global_comm_dim_size="
+                f"{global_comm_dim_size}, world_size={world_size})."
+            )
+
+        if padded_local_size != original_local_size:
+            # F.pad's pad-spec is built from the LAST dim backwards. comm_dim
+            # is negative; pad only the END of comm_dim.
+            pad_spec = [0, 0] * (-comm_dim - 1) + [0, padded_local_size - original_local_size]
+            U_work = [torch.nn.functional.pad(u, pad_spec) for u in U_work]
+
         input_chunks = [
             torch.stack(U_work[r * per_rank : (r + 1) * per_rank])
             for r in range(world_size)
@@ -337,7 +470,13 @@ def megabatch_orthogonalize_async(
         yield
         work.wait()
 
-        result = [recv_chunks[r][i] for r in range(world_size) for i in range(per_rank)]
+        # Narrow each per-rank result back to the rank's original local size.
+        # On padding-only ranks original_local_size == 0 and the slice is empty.
+        result = [
+            recv_chunks[r][i].narrow(comm_dim, 0, original_local_size).contiguous()
+            for r in range(world_size)
+            for i in range(per_rank)
+        ]
         return result[:N]
 
     elif N > 1 and process_group is not None:

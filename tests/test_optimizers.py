@@ -190,6 +190,160 @@ class TestDion2:
         params = _make_params([(128, 32)])
         _run_steps(Dion2, params, dict(lr=0.01, verbose=True))
 
+    def test_3d_params_wide(self):
+        """3D params (batch of wide matrices) should work with select_dim=-2."""
+        from dion import Dion2
+        params = _make_params([(4, 32, 128)])
+        before = params[0].data.clone()
+        _run_steps(Dion2, params, dict(lr=0.01, fraction=0.5), n_steps=3)
+        assert not torch.equal(params[0].data, before)
+
+    def test_3d_params_tall(self):
+        """3D params (batch of tall matrices) should work with select_dim=-1."""
+        from dion import Dion2
+        params = _make_params([(4, 128, 32)])
+        before = params[0].data.clone()
+        _run_steps(Dion2, params, dict(lr=0.01, fraction=0.25), n_steps=3)
+        assert not torch.equal(params[0].data, before)
+
+    def test_3d_params_flatten(self):
+        """3D params with flatten=True should flatten to 2D for ortho."""
+        from dion import Dion2
+        params = _make_params([(4, 32, 128)])
+        _run_steps(Dion2, params, dict(lr=0.01, flatten=True), n_steps=3)
+
+    def test_3d_megabatch(self):
+        """Multiple 3D params with same shape should be megabatched."""
+        from dion import Dion2
+        params = _make_params([(4, 32, 64)] * 3)
+        _run_steps(Dion2, params, dict(lr=0.01), n_steps=3)
+
+
+# ---------------------------------------------------------------------------
+# num_heads per-group option (per-head Newton-Schulz on 2D weights)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA required")
+class TestNumHeads:
+    """The ``num_heads`` param-group option lets a 2D weight be treated as a
+    batch of ``num_heads`` matrices for Newton-Schulz, matching the behavior of
+    an equivalent 3D-stored weight without changing the model layout."""
+
+    def _run_parity(self, optimizer_cls, opt_kwargs, num_heads=4, head_dim=8, in_features=16, n_steps=3):
+        torch.manual_seed(0)
+        init = torch.randn(num_heads * head_dim, in_features, device=DEVICE)
+
+        w2d = torch.nn.Parameter(init.clone())
+        opt2d = optimizer_cls(
+            [{"params": [w2d], "num_heads": num_heads}], **opt_kwargs
+        )
+
+        w3d = torch.nn.Parameter(init.clone().view(num_heads, head_dim, in_features))
+        opt3d = optimizer_cls([w3d], **opt_kwargs)
+
+        for step in range(n_steps):
+            torch.manual_seed(100 + step)
+            g = torch.randn(num_heads * head_dim, in_features, device=DEVICE)
+            w2d.grad = g.clone()
+            w3d.grad = g.view(num_heads, head_dim, in_features).clone()
+            opt2d.step()
+            opt3d.step()
+
+        torch.testing.assert_close(
+            w2d.data.view(num_heads, head_dim, in_features), w3d.data
+        )
+
+    def test_muon_matches_3d(self):
+        from dion import Muon
+        self._run_parity(Muon, dict(lr=0.01))
+
+    def test_muon_matches_3d_nesterov(self):
+        from dion import Muon
+        self._run_parity(Muon, dict(lr=0.01, nesterov=True))
+
+    def test_dion2_matches_3d(self):
+        from dion import Dion2
+        self._run_parity(Dion2, dict(lr=0.01, fraction=0.5))
+
+    def test_dion2_matches_3d_full_fraction(self):
+        from dion import Dion2
+        self._run_parity(Dion2, dict(lr=0.01, fraction=1.0))
+
+    def test_normuon_matches_3d(self):
+        from dion import NorMuon
+        self._run_parity(NorMuon, dict(lr=0.01))
+
+    def test_muon_invalid_num_heads(self):
+        from dion import Muon
+        w = torch.nn.Parameter(torch.randn(30, 16, device=DEVICE))
+        w.grad = torch.randn_like(w)
+        # 30 not divisible by 4
+        opt = Muon([{"params": [w], "num_heads": 4}], lr=0.01)
+        with pytest.raises(ValueError, match="num_heads"):
+            opt.step()
+
+    def test_muon_num_heads_rejects_1d(self):
+        from dion import Muon
+        # 1D params never reach _prepare_head_split (Muon asserts ndim >= 2),
+        # but a 3D param with num_heads>1 should raise since the reshape assumes 2D.
+        w = torch.nn.Parameter(torch.randn(4, 8, 16, device=DEVICE))
+        w.grad = torch.randn_like(w)
+        opt = Muon([{"params": [w], "num_heads": 2}], lr=0.01)
+        with pytest.raises(ValueError, match="2D"):
+            opt.step()
+
+    def test_megabatch(self):
+        """Multiple 2D params with same shape + num_heads should be megabatched."""
+        from dion import Muon
+        num_heads, head_dim, in_features = 4, 8, 16
+        params = _make_params([(num_heads * head_dim, in_features)] * 3)
+        opt = Muon([{"params": params, "num_heads": num_heads}], lr=0.01)
+        for step in range(3):
+            torch.manual_seed(100 + step)
+            for p in params:
+                p.grad = torch.randn_like(p)
+            opt.step()
+
+    @pytest.mark.parametrize("bad", [0, -1, 2.0, "4", True])
+    def test_invalid_num_heads_raises(self, bad):
+        from dion import Muon
+        w = torch.nn.Parameter(torch.randn(32, 16, device=DEVICE))
+        w.grad = torch.randn_like(w)
+        opt = Muon([{"params": [w], "num_heads": bad}], lr=0.01)
+        with pytest.raises(ValueError, match="num_heads"):
+            opt.step()
+
+    def test_num_heads_one_is_noop(self):
+        # num_heads=1 is semantically equivalent to the default path; verify
+        # it runs without error and doesn't accidentally hit the head-split code.
+        from dion import Muon
+        w = torch.nn.Parameter(torch.randn(32, 16, device=DEVICE))
+        w_ref = torch.nn.Parameter(w.data.clone())
+        g = torch.randn_like(w)
+        for step in range(2):
+            w.grad = g.clone()
+            w_ref.grad = g.clone()
+        opt = Muon([{"params": [w], "num_heads": 1}], lr=0.01)
+        opt_ref = Muon([w_ref], lr=0.01)
+        opt.step()
+        opt_ref.step()
+        torch.testing.assert_close(w.data, w_ref.data)
+
+    def test_flatten_true_incompatible(self):
+        # flatten=True would collapse the per-head 3D view back to 2D, giving
+        # the wrong update silently. It must raise.
+        from dion import Muon
+        num_heads, head_dim, in_features = 4, 8, 16
+        w = torch.nn.Parameter(
+            torch.randn(num_heads * head_dim, in_features, device=DEVICE)
+        )
+        w.grad = torch.randn_like(w)
+        opt = Muon(
+            [{"params": [w], "num_heads": num_heads}], lr=0.01, flatten=True
+        )
+        with pytest.raises(ValueError, match="flatten"):
+            opt.step()
+
 
 # ---------------------------------------------------------------------------
 # Mixed param groups (matrix + scalar)
