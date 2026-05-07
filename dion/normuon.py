@@ -159,19 +159,30 @@ class NorMuon(DistributedOrthoBase):
                 sharding = p.placements if isinstance(p, DTensor) else None
                 shape_groups[(p.shape, sharding, p.dtype)].append(p)
 
+            num_heads = self._resolve_num_heads(group)
+
             for (_shape, _sharding, _dtype), params in shape_groups.items():
                 gradients = [p.grad for p in params]
                 states = [self._get_or_initialize_state(p, self._algo_name) for p in params]
                 momentums = [s["momentum"] for s in states]
                 variances_neuron = [s["variance_neuron"] for s in states]
 
-                is_batch_sharded, is_matrix_sharded, sharded_tensor_dim = (
-                    self._get_shard_info(params[0], group)
-                )
-
-                megabatch_args = update_args
-                if is_batch_sharded and not is_matrix_sharded:
+                if num_heads is not None:
+                    params, gradients, momentums, variances_neuron = (
+                        self._prepare_head_split(
+                            num_heads, params, gradients, momentums, variances_neuron
+                        )
+                    )
                     megabatch_args = {**update_args, "process_group": None}
+                    shard_dim = None
+                else:
+                    is_batch_sharded, is_matrix_sharded, sharded_tensor_dim = (
+                        self._get_shard_info(params[0], group)
+                    )
+                    megabatch_args = update_args
+                    if is_batch_sharded and not is_matrix_sharded:
+                        megabatch_args = {**update_args, "process_group": None}
+                    shard_dim = sharded_tensor_dim
 
                 yield AsyncTask(
                     normuon_update_megabatch_async(
@@ -179,7 +190,7 @@ class NorMuon(DistributedOrthoBase):
                         G=gradients,
                         M=momentums,
                         V=variances_neuron,
-                        shard_dim=sharded_tensor_dim,
+                        shard_dim=shard_dim,
                         **megabatch_args,
                     )
                 )
@@ -220,6 +231,21 @@ def normuon_update_megabatch_async(
     # Convert shard_dim to negative for comm_dim
     comm_dim = (shard_dim - X[0].ndim) if shard_dim is not None else None
 
+    # On the sharded path X[0] must still be a DTensor, so .shape[comm_dim]
+    # is the unsharded global size. The megabatch fn uses this to compute
+    # the rank-consistent pad size for its alltoall. Catch the case where a
+    # future refactor moves to_local(X) above this point and silently
+    # collapses .shape to the local size.
+    if comm_dim is not None:
+        if not isinstance(X[0], DTensor):
+            raise TypeError(
+                "Sharded path requires X[0] to be a DTensor so .shape gives "
+                f"the global size; got {type(X[0]).__name__}."
+            )
+        global_comm_dim_size = X[0].shape[comm_dim]
+    else:
+        global_comm_dim_size = None
+
     # Orthogonalize via shared megabatch communication
     U = yield from megabatch_orthogonalize_async(
         U,
@@ -230,6 +256,7 @@ def normuon_update_megabatch_async(
         newton_schulz_func=newton_schulz_func,
         flatten=flatten,
         epsilon=epsilon,
+        global_comm_dim_size=global_comm_dim_size,
     )
 
     # NorMuon normalization using stacked tensors for fewer kernel launches

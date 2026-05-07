@@ -138,25 +138,34 @@ class Dion2(DistributedOrthoBase):
                 sharding = p.placements if isinstance(p, DTensor) else None
                 shape_groups[(p.shape, sharding, p.dtype)].append(p)
 
+            num_heads = self._resolve_num_heads(group)
+
             for (_shape, _sharding, _dtype), params in shape_groups.items():
                 gradients = [p.grad for p in params]
                 states = [self._get_or_initialize_state(p, self._algo_name) for p in params]
                 momentums = [s["momentum"] for s in states]
 
-                is_batch_sharded, is_matrix_sharded, sharded_tensor_dim = (
-                    self._get_shard_info(params[0], group)
-                )
-
-                megabatch_args = update_args
-                if is_batch_sharded and not is_matrix_sharded:
+                if num_heads is not None:
+                    params, gradients, momentums = self._prepare_head_split(
+                        num_heads, params, gradients, momentums
+                    )
                     megabatch_args = {**update_args, "process_group": None}
+                    shard_dim = None
+                else:
+                    is_batch_sharded, is_matrix_sharded, sharded_tensor_dim = (
+                        self._get_shard_info(params[0], group)
+                    )
+                    megabatch_args = update_args
+                    if is_batch_sharded and not is_matrix_sharded:
+                        megabatch_args = {**update_args, "process_group": None}
+                    shard_dim = sharded_tensor_dim
 
                 yield AsyncTask(
                     dion2_update_megabatch_async(
                         X=params,
                         G=gradients,
                         M=momentums,
-                        shard_dim=sharded_tensor_dim,
+                        shard_dim=shard_dim,
                         **megabatch_args,
                     )
                 )
@@ -220,6 +229,21 @@ def dion2_update_megabatch_async(
     # comm_dim for sharded communication: use select_dim (which equals normalized shard_dim)
     comm_dim = select_dim if is_sharded else None
 
+    # On the sharded path X[0] must still be a DTensor, so .shape[comm_dim]
+    # is the unsharded global size. The megabatch fn uses this to compute
+    # the rank-consistent pad size for its alltoall. Catch the case where a
+    # future refactor moves to_local(X) above this point and silently
+    # collapses .shape to the local size.
+    if comm_dim is not None:
+        if not isinstance(X[0], DTensor):
+            raise TypeError(
+                "Sharded path requires X[0] to be a DTensor so .shape gives "
+                f"the global size; got {type(X[0]).__name__}."
+            )
+        global_comm_dim_size = X[0].shape[comm_dim]
+    else:
+        global_comm_dim_size = None
+
     # Orthogonalize via shared megabatch communication
     U_ortho = yield from megabatch_orthogonalize_async(
         U_selected,
@@ -230,6 +254,7 @@ def dion2_update_megabatch_async(
         newton_schulz_func=newton_schulz_func,
         flatten=flatten,
         epsilon=epsilon,
+        global_comm_dim_size=global_comm_dim_size,
     )
 
     # Compute scaled learning rate
@@ -255,6 +280,20 @@ def dion2_update_megabatch_async(
     )
 
 
+# Workaround for a torch.compile bug in PyTorch ≤2.11's inductor backend:
+# the post-fusion loop reordering pass crashes when ForeachKernelSchedulerNode
+# appears inside a FusedSchedulerNode.  Only triggered by recompilation across
+# different tensor dimensionalities (e.g. 2D then 3D).
+# https://github.com/pytorch/pytorch/issues/176591
+# TODO: remove this decorator when pytorch/pytorch#176591 is fixed.
+_inductor_workaround = (
+    torch._inductor.config.patch(loop_ordering_after_fusion=False)
+    if torch.__version__ < "2.13"
+    else lambda fn: fn
+)
+
+
+@_inductor_workaround
 @torch.compile(fullgraph=True)
 def dion2_pre_orthogonalize(
     G: List[Tensor],
@@ -294,23 +333,34 @@ def dion2_pre_orthogonalize(
     # Batched topk: indices shape (batch_size, k)
     _, indices = torch.topk(slice_norms, k, dim=-1, sorted=False)
 
-    # Batched gather for slice extraction
+    # Extract the selected rows/columns from each momentum tensor.
+    # `indices` has shape (..., k) where k is the number of selected slices.
+    # `gather` requires the index tensor to have the same number of dimensions
+    # as the source, so we expand the indices to cover the non-selected dimension.
     if select_dim == -2:
-        # Selecting rows
+        # Selecting rows: expand indices from (..., k) to (..., k, num_cols)
         num_cols = M[0].size(-1)
-        indices_expanded = indices.unsqueeze(-1).expand(-1, -1, num_cols)
+        indices_expanded = indices.unsqueeze(-1).expand(*indices.shape, num_cols)
         selected_stacked = torch.gather(M_stacked, dim=-2, index=indices_expanded)
     else:
-        # Selecting cols
+        # Selecting cols: expand indices from (..., k) to (..., num_rows, k)
         num_rows = M[0].size(-2)
-        indices_expanded = indices.unsqueeze(-2).expand(-1, num_rows, -1)
+        indices_expanded = indices.unsqueeze(-2).expand(
+            *indices.shape[:-1], num_rows, indices.shape[-1]
+        )
         selected_stacked = torch.gather(M_stacked, dim=-1, index=indices_expanded)
 
-    # Apply error feedback decay to selected slices in original M tensors
+    # Apply error feedback decay to selected slices in the original M tensors.
+    # We reuse the already-gathered slices and write them back (scaled) using
+    # scatter_, which places values into positions specified by the index tensor.
     indices_list = list(indices.unbind(dim=0))
-    for m, idx in zip(M, indices_list):
-        selected_slice = m.index_select(dim=select_dim, index=idx)
-        m.index_copy_(dim=select_dim, index=idx, source=selected_slice * ef_decay)
+    selected_list = list(selected_stacked.unbind(dim=0))
+    for m, idx, selected in zip(M, indices_list, selected_list):
+        if select_dim == -2:
+            idx_exp = idx.unsqueeze(-1).expand(*idx.shape, m.size(-1))
+        else:
+            idx_exp = idx.unsqueeze(-2).expand(*idx.shape[:-1], m.size(-2), idx.shape[-1])
+        m.scatter_(dim=select_dim, index=idx_exp, src=selected * ef_decay)
 
     # Convert to bf16 and unstack for communication
     U_selected = list(selected_stacked.to(dtype=torch.bfloat16).unbind(dim=0))
@@ -318,6 +368,9 @@ def dion2_pre_orthogonalize(
     return U_selected, indices_list
 
 
+# NOTE: if this function starts failing with an InductorError on recompilation
+# across tensor ranks, apply the same _inductor_workaround used on
+# dion2_pre_orthogonalize above.  See pytorch/pytorch#176591.
 @torch.compile(fullgraph=True)
 def dion2_post_orthogonalize(
     X: List[Tensor],
@@ -338,10 +391,17 @@ def dion2_post_orthogonalize(
     # Apply weight update in float32 to match normuon's foreach_sub_ precision.
     # index_add_ requires matching dtypes, so upcast X temporarily.
     neg_lr = -adjusted_lr
-    for x, u, idx in zip(X, U, indices):
-        x_f32 = x.float()
-        x_f32.index_add_(dim=select_dim, index=idx, source=neg_lr * u.float())
-        x.copy_(x_f32.to(x.dtype))
+    U_scaled = [neg_lr * u for u in U]
+    # Apply the orthogonalized update to only the selected rows/columns.
+    # scatter_add_ accumulates values into positions specified by the index tensor:
+    #   x[..., idx_exp[..., i, j], j] += u_scaled[..., i, j]  (for select_dim == -2)
+    # where i ranges over the k selected rows and j over all columns.
+    for x, u_scaled, idx in zip(X, U_scaled, indices):
+        if select_dim == -2:
+            idx_exp = idx.unsqueeze(-1).expand_as(u_scaled)
+        else:
+            idx_exp = idx.unsqueeze(-2).expand_as(u_scaled)
+        x.scatter_add_(dim=select_dim, index=idx_exp, src=u_scaled)
 
 
 # A helper function to print selection choice for each matrix
