@@ -186,6 +186,8 @@ class NorDion2(DistributedOrthoBase):
                 sharding = p.placements if isinstance(p, DTensor) else None
                 shape_groups[(p.shape, sharding, p.dtype)].append((p, name))
 
+            num_heads = self._resolve_num_heads(group)
+
             for (_shape, _sharding, _dtype), items in shape_groups.items():
                 params = [p for p, _ in items]
                 names  = [n for _, n in items]
@@ -194,13 +196,20 @@ class NorDion2(DistributedOrthoBase):
                 momentums = [s["momentum"] for s in states]
                 variances_neuron = [s["variance_neuron"] for s in states]
 
-                is_batch_sharded, is_matrix_sharded, sharded_tensor_dim = (
-                    self._get_shard_info(params[0], group)
-                )
-
-                megabatch_args = update_args
-                if is_batch_sharded and not is_matrix_sharded:
+                if num_heads is not None:
+                    params, gradients, momentums, variances_neuron = self._prepare_head_split(
+                        num_heads, params, gradients, momentums, variances_neuron
+                    )
                     megabatch_args = {**update_args, "process_group": None}
+                    shard_dim = None
+                else:
+                    is_batch_sharded, is_matrix_sharded, sharded_tensor_dim = (
+                        self._get_shard_info(params[0], group)
+                    )
+                    megabatch_args = update_args
+                    if is_batch_sharded and not is_matrix_sharded:
+                        megabatch_args = {**update_args, "process_group": None}
+                    shard_dim = sharded_tensor_dim
 
                 yield AsyncTask(
                     nordion2_update_megabatch_async(
@@ -209,7 +218,7 @@ class NorDion2(DistributedOrthoBase):
                         M=momentums,
                         V=variances_neuron,
                         names=names,
-                        shard_dim=sharded_tensor_dim,
+                        shard_dim=shard_dim,
                         **megabatch_args,
                     )
                 )
@@ -247,6 +256,7 @@ def nordion2_update_megabatch_async(
 
     # Choose Neurons
     select_dim = -2
+    is_sharded = shard_dim is not None
 
     # Update momentum and compute the inputs for orthogonalization
     U_selected, indices_list = nordion2_pre_orthogonalize(
@@ -258,8 +268,24 @@ def nordion2_update_megabatch_async(
         k_sel=k_sel,
     )
 
-    # Convert shard_dim to negative for comm_dim
-    comm_dim = (shard_dim - X[0].ndim) if shard_dim is not None else None
+    # comm_dim is just -2
+    comm_dim = select_dim if is_sharded else None
+
+    # On the sharded path X[0] must still be a DTensor, so .shape[comm_dim]
+    # is the unsharded global size. The megabatch fn uses this to compute
+    # the rank-consistent pad size for its alltoall. Catch the case where a
+    # future refactor moves to_local(X) above this point and silently
+    # collapses .shape to the local size.
+    if comm_dim is not None:
+        if not isinstance(X[0], DTensor):
+            raise TypeError(
+                "Sharded path requires X[0] to be a DTensor so .shape gives "
+                f"the global size; got {type(X[0]).__name__}."
+            )
+        global_comm_dim_size = X[0].shape[comm_dim]
+    else:
+        global_comm_dim_size = None
+
 
     # Orthogonalize via shared megabatch communication
     U_ortho = yield from megabatch_orthogonalize_async(
@@ -271,6 +297,7 @@ def nordion2_update_megabatch_async(
         newton_schulz_func=newton_schulz_func,
         flatten=flatten,
         epsilon=epsilon,
+        global_comm_dim_size=global_comm_dim_size,
     )
 
     # NorDion2 normalization
@@ -305,6 +332,12 @@ def nordion2_update_megabatch_async(
     if wandb is not None and wandb.run is not None:
         for name, idx in zip(names, indices_list):
             wandb.log({f"ortho_sel_k/{name}": idx.tolist(),}, commit=False)
+
+    # Downcast U from f32 (normalization output) to bf16 to match X's dtype for scatter_add_.
+    # This loses some precision vs normuon's foreach_sub_(bf16, f32) which promotes internally.
+    U_normed = [u.to(torch.bfloat16) for u in U_normed]
+    # TODO: For f32-precision updates, upcast only selected rows of X instead:
+    # see dion2_post_orthogonalize with per-row f32 upcast
 
     dion2_post_orthogonalize(
         X=to_local(X),
@@ -364,6 +397,20 @@ def nordion2_normalization(
 
     return normalized_U, V_sel
 
+# Workaround for a torch.compile bug in PyTorch ≤2.11's inductor backend:
+# the post-fusion loop reordering pass crashes when ForeachKernelSchedulerNode
+# appears inside a FusedSchedulerNode.  Only triggered by recompilation across
+# different tensor dimensionalities (e.g. 2D then 3D).
+# https://github.com/pytorch/pytorch/issues/176591
+# TODO: remove this decorator when pytorch/pytorch#176591 is fixed.
+_inductor_workaround = (
+    torch._inductor.config.patch(loop_ordering_after_fusion=False)
+    if torch.__version__ < "2.13"
+    else lambda fn: fn
+)
+
+
+@_inductor_workaround
 def nordion2_pre_orthogonalize(
     G: List[Tensor],
     M: List[Tensor],
@@ -406,13 +453,14 @@ def nordion2_pre_orthogonalize(
     
     # Selecting rows
     num_cols = M[0].size(-1)
-    indices_expanded = indices.unsqueeze(-1).expand(-1, -1, num_cols)
+    indices_expanded = indices.unsqueeze(-1).expand(*indices.shape, num_cols)
     selected_stacked = torch.gather(M_stacked, dim=-2, index=indices_expanded)
     U_selected = list(selected_stacked.to(dtype=torch.bfloat16).unbind(dim=0))
 
     indices_list = list(indices.unbind(dim=0))
-    for m, idx in zip(M, indices_list):
-        selected_slice = m.index_select(dim=-2, index=idx)
-        m.index_copy_(dim=-2, index=idx, source=selected_slice * momentum)
+    selected_list = list(selected_stacked.unbind(dim=0))
+    for m, idx, selected in zip(M, indices_list, selected_list):
+        idx_exp = idx.unsqueeze(-1).expand(*idx.shape, m.size(-1))
+        m.scatter_(dim=-2, index=idx_exp, src=selected * momentum)
 
     return U_selected, indices_list
