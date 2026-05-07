@@ -333,14 +333,12 @@ def nordion2_update_megabatch_async(
         for name, idx in zip(names, indices_list):
             wandb.log({f"ortho_sel_k/{name}": idx.tolist(),}, commit=False)
 
-    # Downcast U from f32 (normalization output) to bf16 to match X's dtype for scatter_add_.
-    # This loses some precision vs normuon's foreach_sub_(bf16, f32) which promotes internally.
-    U_normed = [u.to(torch.bfloat16) for u in U_normed]
-    # TODO: For f32-precision updates, upcast only selected rows of X instead:
-    # see dion2_post_orthogonalize with per-row f32 upcast
+    # Cast U to match X's dtype for scatter_add_ (requires matching dtypes).
+    X_local = to_local(X)
+    U_normed = [u.to(X_local[0].dtype) for u in U_normed]
 
     dion2_post_orthogonalize(
-        X=to_local(X),
+        X=X_local,
         U=U_normed,
         indices=indices_list,
         base_lr=lr,
