@@ -21,8 +21,6 @@ from .megabatch_base import (
 
 from .opt_utils import (
     AsyncTask,
-    create_named_batches,
-    pad_names,
     to_local,
 )
 from .dion2 import dion2_post_orthogonalize
@@ -159,8 +157,8 @@ class NorDion2(DistributedOrthoBase):
                 ]
             else:
                 group_items = [
-                    (p, f"p{i}_{list(p.shape)}")
-                    for i, p in enumerate(group["params"])
+                    (p, "<unnamed>")
+                    for p in group["params"]
                     if p.grad is not None
                 ]
 
