@@ -158,7 +158,11 @@ class NorDion2(DistributedOrthoBase):
                     if p.grad is not None
                 ]
             else:
-                group_items = [(p, "<unnamed>") for p in group["params"] if p.grad is not None]
+                group_items = [
+                    (p, f"p{i}_{list(p.shape)}")
+                    for i, p in enumerate(group["params"])
+                    if p.grad is not None
+                ]
 
             if not group_items:
                 continue
