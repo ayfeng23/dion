@@ -330,8 +330,11 @@ def nordion2_update_megabatch_async(
 
     # Update model parameters with orthogonalized output
     if wandb is not None and wandb.run is not None:
-        for name, idx in zip(names, indices_list):
-            wandb.log({f"ortho_sel_k/{name}": idx.tolist(),}, commit=False)
+        for name, idx, v in zip(names, indices_list, V_local):
+            wandb.log({
+                f"ortho_sel_k/{name}": idx.tolist(),
+                f"nordion2_V/{name}": v.flatten().tolist(),
+            }, commit=False)
 
     # Cast U to match X's dtype for scatter_add_ (requires matching dtypes).
     X_local = to_local(X)
