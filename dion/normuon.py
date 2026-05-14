@@ -1,5 +1,9 @@
 import torch
 from collections import defaultdict
+try:
+    import wandb
+except ImportError:
+    wandb = None
 from torch import Tensor
 from torch.distributed import ProcessGroup
 from torch.distributed.tensor import DeviceMesh, DTensor
@@ -134,8 +138,20 @@ class NorMuon(DistributedOrthoBase):
                 p.ndim >= 2 for p in group["params"]
             ), "NorMuon optimizer only supports matrix parameters."
 
-            group_params = [p for p in group["params"] if p.grad is not None]
-            if not group_params:
+            if "param_names" in group:
+                group_items = [
+                    (p, n)
+                    for p, n in zip(group["params"], group["param_names"])
+                    if p.grad is not None
+                ]
+            else:
+                group_items = [
+                    (p, "<unnamed>")
+                    for p in group["params"]
+                    if p.grad is not None
+                ]
+
+            if not group_items:
                 continue
 
             update_args = dict(
@@ -155,13 +171,15 @@ class NorMuon(DistributedOrthoBase):
             )
 
             shape_groups: dict[tuple, list] = defaultdict(list)
-            for p in group_params:
+            for p, name in group_items:
                 sharding = p.placements if isinstance(p, DTensor) else None
-                shape_groups[(p.shape, sharding, p.dtype)].append(p)
+                shape_groups[(p.shape, sharding, p.dtype)].append((p, name))
 
             num_heads = self._resolve_num_heads(group)
 
-            for (_shape, _sharding, _dtype), params in shape_groups.items():
+            for (_shape, _sharding, _dtype), items in shape_groups.items():
+                params = [p for p, _ in items]
+                names  = [n for _, n in items]
                 gradients = [p.grad for p in params]
                 states = [self._get_or_initialize_state(p, self._algo_name) for p in params]
                 momentums = [s["momentum"] for s in states]
@@ -190,6 +208,7 @@ class NorMuon(DistributedOrthoBase):
                         G=gradients,
                         M=momentums,
                         V=variances_neuron,
+                        names=names,
                         shard_dim=shard_dim,
                         **megabatch_args,
                     )
@@ -201,6 +220,7 @@ def normuon_update_megabatch_async(
     G: List[Tensor],
     M: List[Tensor],
     V: List[Tensor],
+    names: List[str],
     lr: Tensor,
     momentum: Tensor,
     muon_beta2: Tensor,
@@ -277,6 +297,13 @@ def normuon_update_megabatch_async(
         adjusted_lr = adjust_lr_rms_norm(lr, X[0].shape, flatten=flatten)
     else:
         raise ValueError(f"Unknown adjust_lr value: {adjust_lr}")
+
+    # Log V buffer to wandb
+    if wandb is not None and wandb.run is not None:
+        for name, v in zip(names, V_local):
+            wandb.log({
+                f"normuon_V/{name}": v.flatten().tolist(),
+            }, commit=False)
 
     # Post-orthogonalize: apply update
     muon_update_post_orthogonalize(
