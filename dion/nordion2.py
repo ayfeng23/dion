@@ -81,6 +81,7 @@ class NorDion2(DistributedOrthoBase):
         use_triton: bool = False,
         use_polar_express: bool = True,
         newton_schulz_func: Optional[Callable] = None,
+        triton_post_ortho: bool = False,
     ):
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
@@ -119,6 +120,14 @@ class NorDion2(DistributedOrthoBase):
             use_polar_express=use_polar_express,
             newton_schulz_func=newton_schulz_func,
         )
+        if triton_post_ortho:
+            from .dion2_triton import TRITON_AVAILABLE
+            if not TRITON_AVAILABLE:
+                raise ImportError(
+                    "triton_post_ortho=True requires the 'triton' package, which is not installed. "
+                    "Install it with: pip install dion[triton]  (or: pip install triton)"
+                )
+        self._triton_post_ortho = triton_post_ortho
 
     def _get_or_initialize_state(self, param: Tensor, algo: str) -> dict:
         state = super()._get_or_initialize_state(param, algo)
@@ -181,6 +190,7 @@ class NorDion2(DistributedOrthoBase):
                 process_group=self._process_group,
                 newton_schulz_func=self._newton_schulz_func,
                 cautious_wd=group["cautious_wd"],
+                triton_post_ortho=self._triton_post_ortho,
             )
 
             shape_groups: dict[tuple, list] = defaultdict(list)
@@ -248,6 +258,7 @@ def nordion2_update_megabatch_async(
     process_group: Optional[ProcessGroup] = None,
     newton_schulz_func: Optional[Callable] = None,
     cautious_wd: bool = False,
+    triton_post_ortho: bool = False,
 ) -> Generator[None, None, None]:
     """
     Mega-batched NorDion2 update: processes ALL same-shape parameters in one
@@ -342,15 +353,28 @@ def nordion2_update_megabatch_async(
     X_local = to_local(X)
     U_normed = [u.to(X_local[0].dtype) for u in U_normed]
 
-    dion2_post_orthogonalize(
-        X=X_local,
-        U=U_normed,
-        indices=indices_list,
-        base_lr=lr,
-        adjusted_lr=adjusted_lr,
-        weight_decay=weight_decay,
-        select_dim=-2,
-    )
+    if triton_post_ortho:
+        from .dion2_triton import dion2_post_orthogonalize_triton
+
+        dion2_post_orthogonalize_triton(
+            X=X_local,
+            U=U_normed,
+            indices=indices_list,
+            base_lr=lr,
+            adjusted_lr=adjusted_lr,
+            weight_decay=weight_decay,
+            select_dim=-2,
+        )
+    else:
+        dion2_post_orthogonalize(
+            X=X_local,
+            U=U_normed,
+            indices=indices_list,
+            base_lr=lr,
+            adjusted_lr=adjusted_lr,
+            weight_decay=weight_decay,
+            select_dim=-2,
+        )
 
 
 @torch.compile(fullgraph=True)
