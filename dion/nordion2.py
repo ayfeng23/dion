@@ -24,7 +24,6 @@ from .opt_utils import (
     to_local,
 )
 from .dion2 import dion2_post_orthogonalize
-from .normuon import normuon_normalization_stacked
 
 
 class NorDion2(DistributedOrthoBase):
@@ -307,15 +306,15 @@ def nordion2_update_megabatch_async(
     for v, indices in zip(V_local, indices_list):
         selected_v = v.index_select(dim=select_dim, index=indices)
         V_sel.append(selected_v)
-    U_stacked = torch.stack(U_ortho)
-    V_sel_stacked = torch.stack(V_sel).float()
-
-    U_stacked, V_stacked = normuon_normalization_stacked(U_stacked, V_sel_stacked, muon_beta2)
-    U_normed = [U_stacked[i] for i in range(N)]
+    U_normed, V_sel = nordion2_normalization(
+        U_ortho,
+        V_sel=V_sel,
+        muon_beta2=muon_beta2,
+    )
 
     # Copy back updated V_sel to V using indices (cast back from f32)
-    for i, (v, indices) in enumerate(zip(V_local, indices_list)):
-        v.index_copy_(dim=select_dim, index=indices, source=V_stacked[i].to(v.dtype))
+    for v, v_sel, indices in zip(V_local, V_sel, indices_list):
+        v.index_copy_(dim=select_dim, index=indices, source=v_sel.to(v.dtype))
 
     # Compute scaled learning rate
     if adjust_lr is None:
@@ -354,6 +353,39 @@ _inductor_workaround = (
     if torch.__version__ < "2.13"
     else lambda fn: fn
 )
+
+
+@torch.compile(fullgraph=True)
+def nordion2_normalization(
+    U_ortho: List[Tensor],
+    V_sel: List[Tensor],
+    muon_beta2: Tensor,
+) -> Tuple[List[Tensor], List[Tensor]]:
+    U_ortho = [u.float() for u in U_ortho]
+    V_sel = [v.float() for v in V_sel]
+
+    norm_U = [
+        u.norm(p=2, dim=(-2, -1), keepdim=True) for u in U_ortho
+    ]
+
+    U_sq = torch._foreach_mul(U_ortho, U_ortho)
+    neuron_norms = [u_sq.mean(dim=-1, keepdim=True) for u_sq in U_sq]
+
+    torch._foreach_lerp_(V_sel, neuron_norms, 1 - muon_beta2)
+
+    denom = torch._foreach_sqrt(V_sel)
+    torch._foreach_add_(denom, 1e-8)
+    normalized_U = torch._foreach_div(U_ortho, denom)
+
+    norm_U_new = [
+        nu.norm(p=2, dim=(-2, -1), keepdim=True) for nu in normalized_U
+    ]
+    norm_U_new_safe = [nu.clamp(min=1e-8) for nu in norm_U_new]
+
+    ratio = torch._foreach_div(norm_U, norm_U_new_safe)
+    torch._foreach_mul_(normalized_U, ratio)
+
+    return normalized_U, V_sel
 
 
 @_inductor_workaround
