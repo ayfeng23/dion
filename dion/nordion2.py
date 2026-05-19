@@ -117,8 +117,8 @@ class NorDion2(DistributedOrthoBase):
     def _get_or_initialize_state(self, param: Tensor, algo: str) -> dict:
         state = super()._get_or_initialize_state(param, algo)
         if algo == self._algo_name and "variance_neuron" not in state:
-            # V stored in param dtype (bf16); upcast to fp32 for compute, truncated back on write
-            state["variance_neuron"] = torch.zeros_like(param[..., 0:1])
+            # Initialize V to fp32 for better stability and minimal memory overhead
+            state["variance_neuron"] = torch.zeros_like(param[..., 0:1], dtype=torch.float32)
         return state
 
     def _get_shard_info(self, param: Tensor, group: dict):
@@ -276,21 +276,22 @@ def nordion2_update_megabatch_async(
     )
 
     # Update variance neuron buffer for each selected row and normalize orthonormalized update
-    # V is stored in param dtype (bf16) but compute is done in fp32
     V_local = to_local(V)
     V_sel = []
     for v, indices in zip(V_local, indices_list):
         selected_v = v.index_select(dim=select_dim, index=indices)
         V_sel.append(selected_v)
     U_stacked = torch.stack(U_ortho)
-    V_sel_stacked = torch.stack(V_sel).float()  # upcast to fp32 for normalization
+    V_sel_stacked = torch.stack(V_sel)
 
     U_stacked, V_stacked = normuon_normalization_stacked(U_stacked, V_sel_stacked, muon_beta2)
+    for i in range(N):
+        V_sel[i].copy_(V_stacked[i])
     U_normed = [U_stacked[i] for i in range(N)]
 
-    # Copy back V: truncate fp32 -> bf16 on write-back
-    for i, (v, indices) in enumerate(zip(V_local, indices_list)):
-        v.index_copy_(dim=select_dim, index=indices, source=V_stacked[i].to(v.dtype))
+    # Copy back update V_sel to V using indices
+    for v, v_sel, indices in zip(V_local, V_sel, indices_list):
+        v.index_copy_(dim=select_dim, index=indices, source=v_sel)
 
     # Compute scaled learning rate
     # Do this before to_local(X) because we use the full tensor shape, not the shard shape
