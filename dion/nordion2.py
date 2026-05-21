@@ -23,7 +23,7 @@ from .opt_utils import (
     AsyncTask,
     to_local,
 )
-from .dion2 import dion2_post_orthogonalize
+from .dion2 import dion2_pre_orthogonalize, dion2_post_orthogonalize
 from .normuon import normuon_normalization_stacked
 
 
@@ -260,13 +260,12 @@ def nordion2_update_megabatch_async(
     is_sharded = shard_dim is not None
 
     # Update momentum and compute the inputs for orthogonalization
-    U_selected, indices_list = nordion2_pre_orthogonalize(
+    U_selected, indices_list = dion2_pre_orthogonalize(
         G=to_local(G),
         M=to_local(M),
         fraction=fraction,
-        momentum=momentum,
-        nesterov=nesterov,
-        k_sel=k_sel,
+        ef_decay=momentum,
+        select_dim=-2,
     )
 
     # comm_dim is just -2
@@ -354,51 +353,3 @@ _inductor_workaround = (
     if torch.__version__ < "2.13"
     else lambda fn: fn
 )
-
-
-@_inductor_workaround
-def nordion2_pre_orthogonalize(
-    G: List[Tensor],
-    M: List[Tensor],
-    fraction: float,
-    momentum: Tensor,
-    nesterov: bool,
-    k_sel: str,
-) -> List[Tensor]:
-    dtype = M[0].dtype
-
-    num_select = M[0].size(-2)
-    k = max(1, int(math.ceil(fraction * num_select)))
-
-    G = [g.to(dtype=dtype) for g in G]
-
-    torch._foreach_add_(M, G)
-    assert nesterov == False
-
-    M_stacked = torch.stack(M, dim=0)
-
-    if k_sel == "topk":
-        slice_norms = M_stacked.norm(p=1, dim=-1)
-        scores = slice_norms
-    elif k_sel == "random":
-        batch_size = M_stacked.size(0)
-        num_rows = M_stacked.size(1)
-        scores = torch.rand(batch_size, num_rows, device=M_stacked.device)
-    else:
-        raise ValueError(f"Unknown k_sel value: {k_sel}")
-
-    _, indices = torch.topk(scores, k, dim=-1, sorted=False)
-    indices, _ = indices.sort(dim=-1)
-
-    num_cols = M[0].size(-1)
-    indices_expanded = indices.unsqueeze(-1).expand(*indices.shape, num_cols)
-    selected_stacked = torch.gather(M_stacked, dim=-2, index=indices_expanded)
-    U_selected = list(selected_stacked.to(dtype=torch.bfloat16).unbind(dim=0))
-
-    indices_list = list(indices.unbind(dim=0))
-    selected_list = list(selected_stacked.unbind(dim=0))
-    for m, idx, selected in zip(M, indices_list, selected_list):
-        idx_exp = idx.unsqueeze(-1).expand(*idx.shape, m.size(-1))
-        m.scatter_(dim=-2, index=idx_exp, src=selected * momentum)
-
-    return U_selected, indices_list
