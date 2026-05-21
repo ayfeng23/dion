@@ -304,9 +304,7 @@ def nordion2_update_megabatch_async(
         raise ValueError(f"Unknown adjust_lr: {adjust_lr}")
 
     # Post-orthogonalize: apply update
-    # Cast U to match X's dtype for scatter_add_ (requires matching dtypes).
     X_local = to_local(X)
-    U_normed = [u.to(X_local[0].dtype) for u in U_normed]
 
     if triton_post_ortho:
         from .dion2_triton import dion2_post_orthogonalize_triton
