@@ -412,21 +412,22 @@ def dion2_post_orthogonalize(
     """
     torch._foreach_mul_(X, 1 - base_lr * weight_decay)
 
+    # Convert U to match parameter dtype
+    dtype = X[0].dtype
+    U = [u.to(dtype=dtype) for u in U]
     # Apply weight update
     neg_lr = -adjusted_lr
-    U_scaled = [neg_lr * u.float() for u in U]
+    U_scaled = [neg_lr * u for u in U]
     # Apply the orthogonalized update to only the selected rows/columns.
     # scatter_add_ accumulates values into positions specified by the index tensor:
     #   x[..., idx_exp[..., i, j], j] += u_scaled[..., i, j]  (for select_dim == -2)
     # where i ranges over the k selected rows and j over all columns.
     for x, u_scaled, idx in zip(X, U_scaled, indices):
-        x_f32 = x.float()
         if select_dim == -2:
             idx_exp = idx.unsqueeze(-1).expand_as(u_scaled)
         else:
             idx_exp = idx.unsqueeze(-2).expand_as(u_scaled)
-        x_f32.scatter_add_(dim=select_dim, index=idx_exp, src=u_scaled)
-        x.copy_(x_f32.to(x.dtype))
+        x.scatter_add_(dim=select_dim, index=idx_exp, src=u_scaled)
 
 
 # A helper function to print selection choice for each matrix
