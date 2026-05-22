@@ -118,7 +118,7 @@ class NorDion2(DistributedOrthoBase):
         state = super()._get_or_initialize_state(param, algo)
         if algo == self._algo_name and "variance_neuron" not in state:
             # V stored in param dtype (bf16); upcast to fp32 for compute, truncated back on write
-            state["variance_neuron"] = torch.zeros_like(param[..., 0:1])
+            state["variance_neuron"] = torch.zeros_like(param[..., 0:1], dtype=torch.float32)
         return state
 
     def _get_shard_info(self, param: Tensor, group: dict):
@@ -319,13 +319,13 @@ def nordion2_update_megabatch_async(
             weight_decay=weight_decay,
             select_dim=select_dim,
         )
-    # else:
-    #     dion2_post_orthogonalize(
-    #         X=X_local,
-    #         U=U_normed,
-    #         indices=indices_list,
-    #         base_lr=lr,
-    #         adjusted_lr=adjusted_lr,
-    #         weight_decay=weight_decay,
-    #         select_dim=select_dim,
-    #     )
+    else:
+        dion2_post_orthogonalize(
+            X=X_local,
+            U=U_normed,
+            indices=indices_list,
+            base_lr=lr,
+            adjusted_lr=adjusted_lr,
+            weight_decay=weight_decay,
+            select_dim=select_dim,
+        )
