@@ -1,4 +1,3 @@
-import math
 import torch
 from collections import defaultdict
 from torch import Tensor
@@ -56,7 +55,6 @@ class NorMuon(DistributedOrthoBase):
         params: ParamsT,
         distributed_mesh: Optional[Union[DeviceMesh, ProcessGroup]] = None,
         lr: float = 0.01,
-        fraction: float = 1.0,
         mu: float = 0.95,
         muon_beta2: float = 0.95,
         betas: Tuple[float, float] = (0.9, 0.95),
@@ -73,8 +71,6 @@ class NorMuon(DistributedOrthoBase):
     ):
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
-        if not (0.0 < fraction <= 1.0):
-            raise ValueError(f"fraction must be in (0, 1], got {fraction}")
         if mu < 0.0:
             raise ValueError(f"Invalid momentum factor (mu): {mu}")
         if muon_beta2 < 0.0:
@@ -88,7 +84,6 @@ class NorMuon(DistributedOrthoBase):
 
         defaults = dict(
             lr=lr,
-            fraction=float(fraction),
             mu=mu,
             muon_beta2=muon_beta2,
             beta1=betas[0],
@@ -145,7 +140,6 @@ class NorMuon(DistributedOrthoBase):
 
             update_args = dict(
                 lr=torch.tensor(group["lr"]),
-                fraction=group["fraction"],
                 momentum=torch.tensor(group["mu"]),
                 muon_beta2=torch.tensor(group["muon_beta2"]),
                 weight_decay=torch.tensor(group["weight_decay"]),
@@ -208,7 +202,6 @@ def normuon_update_megabatch_async(
     M: List[Tensor],
     V: List[Tensor],
     lr: Tensor,
-    fraction: float,
     momentum: Tensor,
     muon_beta2: Tensor,
     weight_decay: Tensor,
@@ -229,14 +222,10 @@ def normuon_update_megabatch_async(
     """
     N = len(X)
     assert N == len(G) == len(M) == len(V)
-    select_dim = -2
 
-    U, indices_list = normuon_topk_pre_orthogonalize(
-        G=to_local(G),
-        M=to_local(M),
-        fraction=fraction,
-        momentum=momentum,
-        select_dim=select_dim,
+    # Pre-orthogonalize: do not apply momentum damping before computing U.
+    U = normuon_update_pre_orthogonalize_no_damping(
+        G=to_local(G), M=to_local(M), momentum=momentum, nesterov=nesterov,
     )
 
     # Convert shard_dim to negative for comm_dim
@@ -258,7 +247,7 @@ def normuon_update_megabatch_async(
         global_comm_dim_size = None
 
     # Orthogonalize via shared megabatch communication
-    U_ortho = yield from megabatch_orthogonalize_async(
+    U = yield from megabatch_orthogonalize_async(
         U,
         comm_dim=comm_dim,
         device_rank=device_rank,
@@ -272,12 +261,11 @@ def normuon_update_megabatch_async(
 
     # NorMuon normalization using stacked tensors for fewer kernel launches
     V_local = to_local(V)
-    V_selected = [v.index_select(dim=select_dim, index=indices) for v, indices in zip(V_local, indices_list)]
-    U_stacked = torch.stack(U_ortho)
-    V_stacked = torch.stack(V_selected)
+    U_stacked = torch.stack(U)
+    V_stacked = torch.stack(V_local)
     U_stacked, V_stacked = normuon_normalization_stacked(U_stacked, V_stacked, muon_beta2)
-    for i, (v, indices) in enumerate(zip(V_local, indices_list)):
-        v.index_copy_(dim=select_dim, index=indices, source=V_stacked[i].to(dtype=v.dtype))
+    for i in range(N):
+        V_local[i].copy_(V_stacked[i])
     U = [U_stacked[i] for i in range(N)]
 
     # Compute scaled learning rate
@@ -291,17 +279,9 @@ def normuon_update_megabatch_async(
         raise ValueError(f"Unknown adjust_lr value: {adjust_lr}")
 
     # Post-orthogonalize: apply update
-    X_local = to_local(X)
-    U_full = []
-    for x, u, indices in zip(X_local, U, indices_list):
-        u_full = torch.zeros_like(x)
-        idx_expanded = indices.unsqueeze(-1).expand_as(u)
-        u_full.scatter_(dim=select_dim, index=idx_expanded, src=u.to(dtype=x.dtype))
-        U_full.append(u_full)
-
     muon_update_post_orthogonalize(
-        X=X_local,
-        U=U_full,
+        X=to_local(X),
+        U=U,
         base_lr=lr,
         adjusted_lr=adjusted_lr,
         weight_decay=weight_decay,
@@ -310,48 +290,26 @@ def normuon_update_megabatch_async(
 
 
 @torch.compile(fullgraph=True)
-def normuon_topk_pre_orthogonalize(
+def normuon_update_pre_orthogonalize_no_damping(
     G: List[Tensor],
     M: List[Tensor],
-    fraction: float,
     momentum: Tensor,
-    select_dim: int,
-) -> Tuple[List[Tensor], List[Tensor]]:
+    nesterov: bool,
+) -> List[Tensor]:
     dtype = M[0].dtype
-    num_select = M[0].size(select_dim)
-    norm_dim = -1 if select_dim == -2 else -2
-    k = max(1, int(math.ceil(fraction * num_select)))
-    
     G = [g.to(dtype=dtype) for g in G]
-    torch._foreach_mul_(M, momentum)
+
     torch._foreach_add_(M, G)
-    M_stacked = torch.stack(M, dim=0)
 
-    slice_norms = M_stacked.norm(p=1, dim=norm_dim)
-    _, indices = torch.topk(slice_norms, k, dim=-1, sorted=False)
-
-    if select_dim == -2:
-        num_cols = M[0].size(-1)
-        indices_expanded = indices.unsqueeze(-1).expand(*indices.shape, num_cols)
-        selected_stacked = torch.gather(M_stacked, dim=-2, index=indices_expanded)
+    if nesterov:
+        U = torch._foreach_mul(M, momentum)
+        torch._foreach_add_(U, G)
     else:
-        num_rows = M[0].size(-2)
-        indices_expanded = indices.unsqueeze(-2).expand(
-            *indices.shape[:-1], num_rows, indices.shape[-1]
-        )
-        selected_stacked = torch.gather(M_stacked, dim=-1, index=indices_expanded)
+        U = M
 
-    indices_list = list(indices.unbind(dim=0))
-    selected_list = list(selected_stacked.unbind(dim=0))
-    for m, idx, selected in zip(M, indices_list, selected_list):
-        if select_dim == -2:
-            idx_exp = idx.unsqueeze(-1).expand(*idx.shape, m.size(-1))
-        else:
-            idx_exp = idx.unsqueeze(-2).expand(*idx.shape[:-1], m.size(-2), idx.shape[-1])
-        m.scatter_(dim=select_dim, index=idx_exp, src=selected)
-
-    U_selected = list(selected_stacked.to(dtype=torch.bfloat16).unbind(dim=0))
-    return U_selected, indices_list
+    U = [u.to(dtype=torch.bfloat16) for u in U]
+    torch._foreach_mul_(M, momentum)
+    return U
 
 
 @torch.compile(fullgraph=True)
