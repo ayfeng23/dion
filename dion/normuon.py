@@ -14,6 +14,7 @@ from .megabatch_base import (
 )
 from .opt_utils import AsyncTask, to_local
 from .muon import muon_update_pre_orthogonalize, muon_update_post_orthogonalize
+from .dion2_triton import dion2_post_orthogonalize_triton
 
 
 class NorMuon(DistributedOrthoBase):
@@ -262,10 +263,10 @@ def normuon_update_megabatch_async(
     # NorMuon normalization using stacked tensors for fewer kernel launches
     V_local = to_local(V)
     U_stacked = torch.stack(U)
-    V_stacked = torch.stack(V_local).float()
+    V_stacked = torch.stack(V_local)
     U_stacked, V_stacked = normuon_normalization_stacked(U_stacked, V_stacked, muon_beta2)
-    for i, v in enumerate(V_local):
-        v.copy_(V_stacked[i].to(v.dtype))
+    for i in range(N):
+        V_local[i].copy_(V_stacked[i])
     U = [U_stacked[i] for i in range(N)]
 
     # Compute scaled learning rate
@@ -279,15 +280,16 @@ def normuon_update_megabatch_async(
         raise ValueError(f"Unknown adjust_lr value: {adjust_lr}")
 
     # Post-orthogonalize: apply update
-    muon_update_post_orthogonalize(
+    indices_list = [torch.arange(u.size(-2), device=u.device) for u in U]
+    dion2_post_orthogonalize_triton(
         X=to_local(X),
         U=U,
+        indices=indices_list,
         base_lr=lr,
         adjusted_lr=adjusted_lr,
         weight_decay=weight_decay,
-        cautious_wd=cautious_wd,
+        select_dim=-2,
     )
-
 
 @torch.compile(fullgraph=True)
 def normuon_normalization_stacked(
