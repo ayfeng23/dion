@@ -13,7 +13,7 @@ from .megabatch_base import (
     adjust_lr_rms_norm,
 )
 from .opt_utils import AsyncTask, to_local
-from .muon import muon_update_post_orthogonalize
+from .muon import muon_update_pre_orthogonalize, muon_update_post_orthogonalize
 
 
 class NorMuon(DistributedOrthoBase):
@@ -223,8 +223,8 @@ def normuon_update_megabatch_async(
     N = len(X)
     assert N == len(G) == len(M) == len(V)
 
-    # Pre-orthogonalize: do not apply momentum damping before computing U.
-    U = normuon_update_pre_orthogonalize_no_damping(
+    # Pre-orthogonalize: update momentum
+    U = muon_update_pre_orthogonalize(
         G=to_local(G), M=to_local(M), momentum=momentum, nesterov=nesterov,
     )
 
@@ -262,10 +262,10 @@ def normuon_update_megabatch_async(
     # NorMuon normalization using stacked tensors for fewer kernel launches
     V_local = to_local(V)
     U_stacked = torch.stack(U)
-    V_stacked = torch.stack(V_local)
+    V_stacked = torch.stack(V_local).float()
     U_stacked, V_stacked = normuon_normalization_stacked(U_stacked, V_stacked, muon_beta2)
-    for i in range(N):
-        V_local[i].copy_(V_stacked[i])
+    for i, v in enumerate(V_local):
+        v.copy_(V_stacked[i].to(v.dtype))
     U = [U_stacked[i] for i in range(N)]
 
     # Compute scaled learning rate
@@ -287,29 +287,6 @@ def normuon_update_megabatch_async(
         weight_decay=weight_decay,
         cautious_wd=cautious_wd,
     )
-
-
-@torch.compile(fullgraph=True)
-def normuon_update_pre_orthogonalize_no_damping(
-    G: List[Tensor],
-    M: List[Tensor],
-    momentum: Tensor,
-    nesterov: bool,
-) -> List[Tensor]:
-    dtype = M[0].dtype
-    G = [g.to(dtype=dtype) for g in G]
-
-    torch._foreach_add_(M, G)
-
-    if nesterov:
-        U = torch._foreach_mul(M, momentum)
-        torch._foreach_add_(U, G)
-    else:
-        U = M
-
-    U = [u.to(dtype=torch.bfloat16) for u in U]
-    torch._foreach_mul_(M, momentum)
-    return U
 
 
 @torch.compile(fullgraph=True)
