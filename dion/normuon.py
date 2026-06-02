@@ -44,6 +44,7 @@ class NorMuon(DistributedOrthoBase):
         use_triton: Whether to use Triton kernel for Newton-Schulz. Ignored if custom function is provided.
         newton_schulz_func: Use a custom Newton-Schulz function for orthogonalization.
             Signature is ``func(input: Tensor, epsilon: float) -> Tensor``.
+        triton_normalization: Whether to use Triton kernel for NorMuon normalization step.
 
     Muon optimizer algorithm by Keller Jordan: https://kellerjordan.github.io/posts/muon/
     FSDP2 Muon uses all-to-all communications: https://www.essential.ai/blog/infra
@@ -68,6 +69,7 @@ class NorMuon(DistributedOrthoBase):
         use_triton: bool = False,
         use_polar_express: bool = True,
         newton_schulz_func: Optional[Callable] = None,
+        triton_normalization: bool = False,
     ):
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
@@ -104,6 +106,15 @@ class NorMuon(DistributedOrthoBase):
             use_polar_express=use_polar_express,
             newton_schulz_func=newton_schulz_func,
         )
+        if triton_normalization:
+            from .normalization_triton import TRITON_AVAILABLE
+
+            if not TRITON_AVAILABLE:
+                raise ImportError(
+                    "triton_normalization=True requires the 'triton' package, which is not installed. "
+                    "Install it with: pip install dion[triton]  (or: pip install triton)"
+                )
+        self._triton_normalization = triton_normalization
 
     def _get_or_initialize_state(self, param: Tensor, algo: str) -> dict:
         state = super()._get_or_initialize_state(param, algo)
@@ -152,6 +163,7 @@ class NorMuon(DistributedOrthoBase):
                 process_group=self._process_group,
                 newton_schulz_func=self._newton_schulz_func,
                 cautious_wd=group["cautious_wd"],
+                triton_normalization=self._triton_normalization,
             )
 
             shape_groups: dict[tuple, list] = defaultdict(list)
@@ -215,6 +227,7 @@ def normuon_update_megabatch_async(
     process_group: Optional[ProcessGroup] = None,
     newton_schulz_func: Optional[Callable] = None,
     cautious_wd: bool = False,
+    triton_normalization: bool = False,
 ) -> Generator[None, None, None]:
     """
     Mega-batched NorMuon update: processes ALL same-shape parameters in one
@@ -263,7 +276,18 @@ def normuon_update_megabatch_async(
     V_local = to_local(V)
     U_stacked = torch.stack(U)
     V_stacked = torch.stack(V_local)
-    U_stacked, V_stacked = normuon_normalization_stacked(U_stacked, V_stacked, muon_beta2)
+
+    if triton_normalization:
+        from .normalization_triton import normuon_normalization_triton
+
+        U_stacked, V_stacked = normuon_normalization_triton(
+            U_stacked, V_stacked, muon_beta2
+        )
+    else:
+        U_stacked, V_stacked = normuon_normalization_stacked(
+            U_stacked, V_stacked, muon_beta2
+        )
+
     for i in range(N):
         V_local[i].copy_(V_stacked[i])
     U = [U_stacked[i] for i in range(N)]

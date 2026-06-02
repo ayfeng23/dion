@@ -499,6 +499,7 @@ def init_optimizer(
             adjust_lr=hp.adjust_lr,
             use_triton=(not cli_args.no_triton),
             use_polar_express=cli_args.use_polar_express,
+            triton_normalization=(not cli_args.no_triton),
         )
 
     elif hp.optimizer == "nordion2":
@@ -530,6 +531,7 @@ def init_optimizer(
             use_triton=(not cli_args.no_triton),
             use_polar_express=cli_args.use_polar_express,
             triton_post_ortho=(not cli_args.no_triton),
+            triton_normalization=(not cli_args.no_triton),
         )
 
     elif hp.optimizer == "dion_simple":

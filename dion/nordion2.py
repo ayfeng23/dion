@@ -44,6 +44,7 @@ class NorDion2(DistributedOrthoBase):
         use_triton: Whether to use Triton kernel for Newton-Schulz. Ignored if custom function is provided.
         newton_schulz_func: Use a custom Newton-Schulz function for orthogonalization.
             Signature is ``func(input: Tensor, epsilon: float) -> Tensor``.
+        triton_normalization: Whether to use Triton kernel for NorDion2 normalization step.
 
     NorDion2 optimizer applying Dion2 update to NorMuon
     """
@@ -66,6 +67,7 @@ class NorDion2(DistributedOrthoBase):
         use_gram_newton_schulz: bool = False,
         newton_schulz_func: Optional[Callable] = None,
         triton_post_ortho: bool = False,
+        triton_normalization: bool = False,
     ):
         # Validate hyperparameters
         if lr < 0.0:
@@ -104,14 +106,15 @@ class NorDion2(DistributedOrthoBase):
             use_polar_express=use_polar_express,
             newton_schulz_func=newton_schulz_func,
         )
-        if triton_post_ortho:
+        if triton_post_ortho or triton_normalization:
             from .dion2_triton import TRITON_AVAILABLE
             if not TRITON_AVAILABLE:
                 raise ImportError(
-                    "triton_post_ortho=True requires the 'triton' package, which is not installed. "
+                    "triton_post_ortho=True or triton_normalization=True requires the 'triton' package, which is not installed. "
                     "Install it with: pip install dion[triton]  (or: pip install triton)"
                 )
         self._triton_post_ortho = triton_post_ortho
+        self._triton_normalization = triton_normalization
 
     def _get_or_initialize_state(self, param: Tensor, algo: str) -> dict:
         state = super()._get_or_initialize_state(param, algo)
@@ -161,6 +164,7 @@ class NorDion2(DistributedOrthoBase):
                 process_group=self._process_group,
                 newton_schulz_func=self._newton_schulz_func,
                 triton_post_ortho=self._triton_post_ortho,
+                triton_normalization=self._triton_normalization,
             )
 
             shape_groups: dict[tuple, list] = defaultdict(list)
@@ -222,6 +226,7 @@ def nordion2_update_megabatch_async(
     process_group: Optional[ProcessGroup] = None,
     newton_schulz_func: Optional[Callable] = None,
     triton_post_ortho: bool = False,
+    triton_normalization: bool = False,
 ) -> Generator[None, None, None]:
     """
     Mega-batched NorDion2 update: processes ALL same-shape parameters in one
@@ -286,7 +291,17 @@ def nordion2_update_megabatch_async(
     indices_expanded = indices.unsqueeze(-1)
     V_sel_stacked = torch.gather(V_stacked, dim=-2, index=indices_expanded).float() # upcast to fp32 for compute
 
-    U_stacked, V_stacked = normuon_normalization_stacked(U_stacked, V_sel_stacked, muon_beta2)
+    if triton_normalization:
+        from .normalization_triton import normuon_normalization_triton
+
+        U_stacked, V_stacked = normuon_normalization_triton(
+            U_stacked, V_sel_stacked, muon_beta2
+        )
+    else:
+        U_stacked, V_stacked = normuon_normalization_stacked(
+            U_stacked, V_sel_stacked, muon_beta2
+        )
+
     U_normed = [U_stacked[i] for i in range(N)]
 
     for v, idx, v_sel in zip(V_local, indices_list, V_stacked):
