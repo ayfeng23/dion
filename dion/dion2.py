@@ -1,5 +1,9 @@
 import math
 import torch
+try:
+    import wandb
+except ImportError:
+    wandb = None
 from collections import defaultdict
 from torch import Tensor
 from torch.distributed import ProcessGroup
@@ -123,8 +127,20 @@ class Dion2(DistributedOrthoBase):
                 p.ndim >= 2 for p in group["params"]
             ), "Dion2 only supports matrix parameters."
 
-            group_params = [p for p in group["params"] if p.grad is not None]
-            if not group_params:
+            if "param_names" in group:
+                group_items = [
+                    (p, n)
+                    for p, n in zip(group["params"], group["param_names"])
+                    if p.grad is not None
+                ]
+            else:
+                group_items = [
+                    (p, "<unnamed>")
+                    for p in group["params"]
+                    if p.grad is not None
+                ]
+
+            if not group_items:
                 continue
 
             update_args = dict(
@@ -144,13 +160,15 @@ class Dion2(DistributedOrthoBase):
             )
 
             shape_groups: dict[tuple, list] = defaultdict(list)
-            for p in group_params:
+            for p, name in group_items:
                 sharding = p.placements if isinstance(p, DTensor) else None
-                shape_groups[(p.shape, sharding, p.dtype)].append(p)
+                shape_groups[(p.shape, sharding, p.dtype)].append((p, name))
 
             num_heads = self._resolve_num_heads(group)
 
-            for (_shape, _sharding, _dtype), params in shape_groups.items():
+            for (_shape, _sharding, _dtype), items in shape_groups.items():
+                params = [p for p, _ in items]
+                names  = [n for _, n in items]
                 gradients = [p.grad for p in params]
                 states = [self._get_or_initialize_state(p, self._algo_name) for p in params]
                 momentums = [s["momentum"] for s in states]
@@ -175,6 +193,7 @@ class Dion2(DistributedOrthoBase):
                         X=params,
                         G=gradients,
                         M=momentums,
+                        names=names,
                         shard_dim=shard_dim,
                         **megabatch_args,
                     )
@@ -185,6 +204,7 @@ def dion2_update_megabatch_async(
     X: List[Tensor],  # All same-shape params (may be more than world_size)
     G: List[Tensor],  # Gradient
     M: List[Tensor],  # Momentum buffer (modified in place)
+    names: List[str], 
     lr: Tensor,  # Learning rate (scalar tensor)
     ef_decay: Tensor,  # Error-feedback factor (scalar tensor)
     fraction: float,  # Fraction of submatrix to orthogonalize (0 < fraction <= 1)
@@ -278,6 +298,16 @@ def dion2_update_megabatch_async(
         adjusted_lr = adjust_lr_rms_norm(lr, X[0].shape, flatten=flatten)
     else:
         raise ValueError(f"Unknown adjust_lr: {adjust_lr}")
+
+    if wandb is not None and wandb.run is not None:
+        for name, idx, u in zip(names, indices_list, U_ortho):
+            u_neuron_norm = u.norm(dim=-1)
+            s = torch.linalg.svdvals(u)
+            wandb.log({
+                f"ortho_sel_k/{name}": idx.tolist(),
+                f"neuron_update_norm/{name}": u_neuron_norm.flatten().tolist(),
+                f"neuron_update_svd/{name}": s.tolist(),
+            }, commit=False)
 
     # Post-orthogonalize: apply update
     if triton_post_ortho:
