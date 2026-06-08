@@ -302,7 +302,7 @@ def dion2_update_megabatch_async(
     if wandb is not None and wandb.run is not None:
         for name, idx, u in zip(names, indices_list, U_ortho):
             u_neuron_norm = u.norm(dim=-1)
-            s = torch.linalg.svdvals(u)
+            s = torch.linalg.svdvals(u.float())
             wandb.log({
                 f"ortho_sel_k/{name}": idx.tolist(),
                 f"neuron_update_norm/{name}": u_neuron_norm.flatten().tolist(),

@@ -326,7 +326,7 @@ def nordion2_update_megabatch_async(
     if wandb is not None and wandb.run is not None:
         for name, idx, v, u in zip(names, indices_list, V_local, U_normed):
             u_neuron_norm = u.norm(dim=-1)
-            s = torch.linalg.svdvals(u)
+            s = torch.linalg.svdvals(u.float())
             wandb.log({
                 f"ortho_sel_k/{name}": idx.tolist(),
                 f"nordion2_V/{name}": v.flatten().tolist(),
