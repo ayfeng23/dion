@@ -1,5 +1,6 @@
 import math
 import torch
+import torch.distributed as dist
 try:
     import wandb
 except ImportError:
@@ -121,6 +122,10 @@ class Dion2(DistributedOrthoBase):
         Mega-batched Dion2 task creation: groups ALL same-shape parameters
         into a single task to minimize communication rounds and kernel launches.
         """
+        # Update module-level step counter (used for SVD logging frequency)
+        if param_groups:
+            _dion2_step_counter[0] = param_groups[0]["step"]
+
         for group in param_groups:
             assert group["algorithm"] == self._algo_name
             assert all(
@@ -299,15 +304,17 @@ def dion2_update_megabatch_async(
     else:
         raise ValueError(f"Unknown adjust_lr: {adjust_lr}")
 
-    if wandb is not None and wandb.run is not None:
-        for name, idx, u in zip(names, indices_list, U_ortho):
-            u_neuron_norm = u.norm(dim=-1)
-            s = torch.linalg.svdvals(u.float())
-            wandb.log({
-                f"ortho_sel_k/{name}": idx.tolist(),
-                f"neuron_update_norm/{name}": u_neuron_norm.flatten().tolist(),
-                f"neuron_update_svd/{name}": s.tolist(),
-            }, commit=False)
+    # All ranks must participate in all-gather (wandb.run may only be set on rank 0)
+    if wandb is not None and (wandb.run is not None or world_size > 1):
+        _log_all_gathered_dion2(
+            names=names,
+            indices_list=indices_list,
+            U_ortho=U_ortho,
+            device_rank=device_rank,
+            world_size=world_size,
+            process_group=process_group,
+            log_svd=(_dion2_step_counter[0] % 50 == 0),
+        )
 
     # Post-orthogonalize: apply update
     if triton_post_ortho:
@@ -332,6 +339,66 @@ def dion2_update_megabatch_async(
             weight_decay=weight_decay,
             select_dim=select_dim,
         )
+
+
+# Step counter for SVD logging frequency
+_dion2_step_counter = [0]
+
+
+def _log_all_gathered_dion2(
+    names: List[str],
+    indices_list: List[Tensor],
+    U_ortho: List[Tensor],
+    device_rank: int,
+    world_size: int,
+    process_group: Optional[ProcessGroup],
+    log_svd: bool = False,
+):
+    """All-gather norms and indices across FSDP ranks; log from rank 0.
+    Every 50 steps (when log_svd=True), also all-gather full U matrices and compute global SVD."""
+    if world_size <= 1:
+        for name, idx, u in zip(names, indices_list, U_ortho):
+            payload = {
+                f"ortho_sel_k/{name}": idx.tolist(),
+                f"neuron_update_norm/{name}": u.norm(dim=-1).flatten().tolist(),
+            }
+            if log_svd:
+                s = torch.linalg.svdvals(u.float())
+                payload[f"neuron_update_svd/{name}"] = s.tolist()
+            wandb.log(payload, commit=False)
+        return
+
+    for i, (name, idx, u) in enumerate(zip(names, indices_list, U_ortho)):
+        local_norms = u.norm(dim=-1).flatten()  # [k]
+
+        # Offset indices by rank * local_shard_rows for global neuron IDs
+        local_shard_rows = int(idx.max().item()) + 1
+        global_idx = idx + device_rank * local_shard_rows
+
+        # All-gather indices
+        gathered_idx = [torch.empty_like(global_idx) for _ in range(world_size)]
+        dist.all_gather(gathered_idx, global_idx, group=process_group)
+
+        # All-gather norms
+        gathered_norms = [torch.empty_like(local_norms) for _ in range(world_size)]
+        dist.all_gather(gathered_norms, local_norms, group=process_group)
+
+        # All-gather full U matrices for global SVD (expensive, only every 50 steps)
+        if log_svd:
+            u_flat = u.contiguous()
+            gathered_u = [torch.empty_like(u_flat) for _ in range(world_size)]
+            dist.all_gather(gathered_u, u_flat, group=process_group)
+
+        if device_rank == 0:
+            payload = {
+                f"ortho_sel_k/{name}": torch.cat(gathered_idx).tolist(),
+                f"neuron_update_norm/{name}": torch.cat(gathered_norms).tolist(),
+            }
+            if log_svd:
+                global_u = torch.cat(gathered_u, dim=0).float()  # [k*world_size, cols]
+                s = torch.linalg.svdvals(global_u)
+                payload[f"neuron_update_svd/{name}"] = s.tolist()
+            wandb.log(payload, commit=False)
 
 
 # Workaround for a torch.compile bug in PyTorch ≤2.11's inductor backend:

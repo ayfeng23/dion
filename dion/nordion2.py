@@ -1,4 +1,5 @@
 import torch
+import torch.distributed as dist
 try:
     import wandb
 except ImportError:
@@ -141,6 +142,10 @@ class NorDion2(DistributedOrthoBase):
         Mega-batched NorDion2 task creation: groups ALL same-shape parameters
         into a single task to minimize communication rounds and kernel launches.
         """
+        # Update module-level step counter (used for SVD logging frequency)
+        if param_groups:
+            _nordion2_step_counter[0] = param_groups[0]["step"]
+
         for group in param_groups:
             assert group["algorithm"] == self._algo_name
             assert all(
@@ -220,6 +225,10 @@ class NorDion2(DistributedOrthoBase):
                         **megabatch_args,
                     )
                 )
+
+
+# Step counter for SVD logging frequency (shared across shape groups within one step)
+_nordion2_step_counter = [0]
 
 
 def nordion2_update_megabatch_async(
@@ -323,16 +332,19 @@ def nordion2_update_megabatch_async(
     else:
         raise ValueError(f"Unknown adjust_lr: {adjust_lr}")
 
-    if wandb is not None and wandb.run is not None:
-        for name, idx, v, u in zip(names, indices_list, V_local, U_normed):
-            u_neuron_norm = u.norm(dim=-1)
-            s = torch.linalg.svdvals(u.float())
-            wandb.log({
-                f"ortho_sel_k/{name}": idx.tolist(),
-                f"nordion2_V/{name}": v.flatten().tolist(),
-                f"neuron_update_norm/{name}": u_neuron_norm.flatten().tolist(),
-                f"neuron_update_svd/{name}": s.tolist(),
-            }, commit=False)
+    # All ranks must participate in all-gather (wandb.run may only be set on rank 0)
+    if wandb is not None and (wandb.run is not None or world_size > 1):
+        _log_all_gathered(
+            names=names,
+            indices_list=indices_list,
+            V_local=V_local,
+            U_normed=U_normed,
+            device_rank=device_rank,
+            world_size=world_size,
+            process_group=process_group,
+            log_v=True,
+            log_svd=(_nordion2_step_counter[0] % 50 == 0),
+        )
 
     # Post-orthogonalize: apply update
     # Cast U to match X's dtype for scatter_add_ (requires matching dtypes).
@@ -360,6 +372,82 @@ def nordion2_update_megabatch_async(
             weight_decay=weight_decay,
             select_dim=select_dim,
         )
+
+
+def _log_all_gathered(
+    names: List[str],
+    indices_list: List[Tensor],
+    V_local: List[Tensor],
+    U_normed: List[Tensor],
+    device_rank: int,
+    world_size: int,
+    process_group: Optional[ProcessGroup],
+    log_v: bool = False,
+    log_svd: bool = False,
+):
+    """All-gather norms, V, and indices across FSDP ranks; log from rank 0.
+    Every 50 steps (when log_svd=True), also all-gather full U matrices and compute global SVD."""
+    if world_size <= 1:
+        # Single GPU — log directly without all-gather
+        for i, (name, idx, u) in enumerate(zip(names, indices_list, U_normed)):
+            payload = {
+                f"ortho_sel_k/{name}": idx.tolist(),
+                f"neuron_update_norm/{name}": u.norm(dim=-1).flatten().tolist(),
+            }
+            if log_v:
+                payload[f"nordion2_V/{name}"] = V_local[i].flatten().tolist()
+            if log_svd:
+                s = torch.linalg.svdvals(u.float())
+                payload[f"neuron_update_svd/{name}"] = s.tolist()
+            wandb.log(payload, commit=False)
+        return
+
+    for i, (name, idx, u) in enumerate(zip(names, indices_list, U_normed)):
+        local_norms = u.norm(dim=-1).flatten()  # [k]
+
+        # Offset indices by rank * local_shard_rows for global neuron IDs
+        if log_v:
+            local_shard_rows = V_local[i].shape[0]
+        else:
+            local_shard_rows = int(idx.max().item()) + 1
+        global_idx = idx + device_rank * local_shard_rows
+
+        # All-gather indices
+        gathered_idx = [torch.empty_like(global_idx) for _ in range(world_size)]
+        dist.all_gather(gathered_idx, global_idx, group=process_group)
+
+        # All-gather norms
+        gathered_norms = [torch.empty_like(local_norms) for _ in range(world_size)]
+        dist.all_gather(gathered_norms, local_norms, group=process_group)
+
+        # All-gather full U matrices for global SVD (expensive, only every 50 steps)
+        if log_svd:
+            u_flat = u.contiguous()
+            gathered_u = [torch.empty_like(u_flat) for _ in range(world_size)]
+            dist.all_gather(gathered_u, u_flat, group=process_group)
+
+        if device_rank == 0:
+            full_idx = torch.cat(gathered_idx).tolist()
+            full_norms = torch.cat(gathered_norms).tolist()
+            payload = {
+                f"ortho_sel_k/{name}": full_idx,
+                f"neuron_update_norm/{name}": full_norms,
+            }
+            if log_v:
+                v_local = V_local[i].flatten()
+                gathered_v = [torch.empty_like(v_local) for _ in range(world_size)]
+                dist.all_gather(gathered_v, v_local, group=process_group)
+                payload[f"nordion2_V/{name}"] = torch.cat(gathered_v).tolist()
+            if log_svd:
+                global_u = torch.cat(gathered_u, dim=0).float()  # [k*world_size, cols]
+                s = torch.linalg.svdvals(global_u)
+                payload[f"neuron_update_svd/{name}"] = s.tolist()
+            wandb.log(payload, commit=False)
+        else:
+            if log_v:
+                v_local = V_local[i].flatten()
+                gathered_v = [torch.empty_like(v_local) for _ in range(world_size)]
+                dist.all_gather(gathered_v, v_local, group=process_group)
 
 
 @torch.compile(fullgraph=True)
