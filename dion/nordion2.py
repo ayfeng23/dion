@@ -341,6 +341,7 @@ def nordion2_update_megabatch_async(
         step=_nordion2_step_counter[0],
         device_rank=device_rank,
         world_size=world_size,
+        shard_size=X[0].shape[select_dim] // world_size if is_sharded else X[0].shape[select_dim],
     )
 
     # Post-orthogonalize: apply update
@@ -378,9 +379,10 @@ def _log_norms_to_file_nordion2(
     step: int,
     device_rank: int,
     world_size: int,
+    shard_size: int = 0,
 ):
     """Save per-rank update norms and selected indices to file."""
-    out_dir = "norm_logs"
+    out_dir = os.path.join(os.environ.get("OUTPUT_ROOT", "."), "norm_logs")
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, f"step_{step:06d}_rank_{device_rank}.pt")
     norms = {}
@@ -392,6 +394,7 @@ def _log_norms_to_file_nordion2(
         "step": step,
         "rank": device_rank,
         "world_size": world_size,
+        "shard_size": shard_size,
         "norms": norms,
         "indices": indices,
     }, path)

@@ -365,7 +365,7 @@ def _log_norms_to_file(
     world_size: int,
 ):
     """Save per-rank update norms to file. No all-gather needed."""
-    out_dir = "norm_logs"
+    out_dir = os.path.join(os.environ.get("OUTPUT_ROOT", "."), "norm_logs")
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, f"step_{step:06d}_rank_{device_rank}.pt")
     norms = {name: u.norm(dim=-1).flatten().detach().cpu() for name, u in zip(names, U)}
