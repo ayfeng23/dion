@@ -342,8 +342,8 @@ def nordion2_update_megabatch_async(
             device_rank=device_rank,
             world_size=world_size,
             process_group=process_group,
-            log_v=True,
-            log_svd=(_nordion2_step_counter[0] % 50 == 0),
+            log_v=False, #True,
+            log_svd=False, #(_nordion2_step_counter[0] % 50 == 0),
         )
 
     # Post-orthogonalize: apply update

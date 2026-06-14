@@ -313,7 +313,7 @@ def dion2_update_megabatch_async(
             device_rank=device_rank,
             world_size=world_size,
             process_group=process_group,
-            log_svd=(_dion2_step_counter[0] % 50 == 0),
+            log_svd=False, #(_dion2_step_counter[0] % 50 == 0),
         )
 
     # Post-orthogonalize: apply update

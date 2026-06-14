@@ -1,4 +1,9 @@
 import torch
+import torch.distributed as dist
+try:
+    import wandb
+except ImportError:
+    wandb = None
 from collections import defaultdict
 from torch import Tensor
 from torch.distributed import ProcessGroup
@@ -134,8 +139,20 @@ class NorMuon(DistributedOrthoBase):
                 p.ndim >= 2 for p in group["params"]
             ), "NorMuon optimizer only supports matrix parameters."
 
-            group_params = [p for p in group["params"] if p.grad is not None]
-            if not group_params:
+            if "param_names" in group:
+                group_items = [
+                    (p, n)
+                    for p, n in zip(group["params"], group["param_names"])
+                    if p.grad is not None
+                ]
+            else:
+                group_items = [
+                    (p, "<unnamed>")
+                    for p in group["params"]
+                    if p.grad is not None
+                ]
+
+            if not group_items:
                 continue
 
             update_args = dict(
@@ -155,13 +172,15 @@ class NorMuon(DistributedOrthoBase):
             )
 
             shape_groups: dict[tuple, list] = defaultdict(list)
-            for p in group_params:
+            for p, name in group_items:
                 sharding = p.placements if isinstance(p, DTensor) else None
-                shape_groups[(p.shape, sharding, p.dtype)].append(p)
+                shape_groups[(p.shape, sharding, p.dtype)].append((p, name))
 
             num_heads = self._resolve_num_heads(group)
 
-            for (_shape, _sharding, _dtype), params in shape_groups.items():
+            for (_shape, _sharding, _dtype), items in shape_groups.items():
+                params = [p for p, _ in items]
+                names = [n for _, n in items]
                 gradients = [p.grad for p in params]
                 states = [self._get_or_initialize_state(p, self._algo_name) for p in params]
                 momentums = [s["momentum"] for s in states]
@@ -190,6 +209,7 @@ class NorMuon(DistributedOrthoBase):
                         G=gradients,
                         M=momentums,
                         V=variances_neuron,
+                        names=names,
                         shard_dim=shard_dim,
                         **megabatch_args,
                     )
@@ -201,6 +221,7 @@ def normuon_update_megabatch_async(
     G: List[Tensor],
     M: List[Tensor],
     V: List[Tensor],
+    names: List[str],
     lr: Tensor,
     momentum: Tensor,
     muon_beta2: Tensor,
@@ -268,6 +289,16 @@ def normuon_update_megabatch_async(
         V_local[i].copy_(V_stacked[i])
     U = [U_stacked[i] for i in range(N)]
 
+    # Log update norms (all ranks participate in all-gather)
+    if wandb is not None and (wandb.run is not None or world_size > 1):
+        _log_normuon_norms(
+            names=names,
+            U=U,
+            device_rank=device_rank,
+            world_size=world_size,
+            process_group=process_group,
+        )
+
     # Compute scaled learning rate
     if adjust_lr is None:
         adjusted_lr = lr
@@ -322,3 +353,33 @@ def normuon_normalization_stacked(
     normalized_U = normalized_U * (norm_U / norm_U_new)
 
     return normalized_U, V
+
+
+def _log_normuon_norms(
+    names: List[str],
+    U: List[Tensor],
+    device_rank: int,
+    world_size: int,
+    process_group: Optional[ProcessGroup],
+):
+    """All-gather update norms across FSDP ranks; log from rank 0."""
+    if world_size <= 1:
+        for name, u in zip(names, U):
+            payload = {
+                f"neuron_update_norm/{name}": u.norm(dim=-1).flatten().tolist(),
+            }
+            wandb.log(payload, commit=False)
+        return
+
+    for name, u in zip(names, U):
+        local_norms = u.norm(dim=-1).flatten()  # [rows_per_rank]
+
+        # All-gather norms
+        gathered_norms = [torch.empty_like(local_norms) for _ in range(world_size)]
+        dist.all_gather(gathered_norms, local_norms, group=process_group)
+
+        if device_rank == 0:
+            payload = {
+                f"neuron_update_norm/{name}": torch.cat(gathered_norms).tolist(),
+            }
+            wandb.log(payload, commit=False)
