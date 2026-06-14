@@ -369,9 +369,15 @@ def _log_norms_to_file(
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, f"step_{step:06d}_rank_{device_rank}.pt")
     norms = {name: u.norm(dim=-1).flatten().detach().cpu() for name, u in zip(names, U)}
-    torch.save({
-        "step": step,
-        "rank": device_rank,
-        "world_size": world_size,
-        "norms": norms,
-    }, path)
+    # Merge with existing file (multiple megabatch groups write to same step+rank)
+    if os.path.exists(path):
+        existing = torch.load(path, weights_only=False)
+        existing["norms"].update(norms)
+        torch.save(existing, path)
+    else:
+        torch.save({
+            "step": step,
+            "rank": device_rank,
+            "world_size": world_size,
+            "norms": norms,
+        }, path)

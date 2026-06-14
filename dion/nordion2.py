@@ -390,14 +390,22 @@ def _log_norms_to_file_nordion2(
     for name, idx, u in zip(names, indices_list, U_normed):
         norms[name] = u.norm(dim=-1).flatten().detach().cpu()
         indices[name] = idx.detach().cpu()
-    torch.save({
-        "step": step,
-        "rank": device_rank,
-        "world_size": world_size,
-        "shard_size": shard_size,
-        "norms": norms,
-        "indices": indices,
-    }, path)
+    # Merge with existing file (multiple megabatch groups write to same step+rank)
+    if os.path.exists(path):
+        existing = torch.load(path, weights_only=False)
+        existing["norms"].update(norms)
+        existing["indices"].update(indices)
+        existing["shard_sizes"].update({name: shard_size for name in names})
+        torch.save(existing, path)
+    else:
+        torch.save({
+            "step": step,
+            "rank": device_rank,
+            "world_size": world_size,
+            "shard_sizes": {name: shard_size for name in names},
+            "norms": norms,
+            "indices": indices,
+        }, path)
 
 
 @torch.compile(fullgraph=True)
