@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.distributed as dist
 try:
@@ -166,6 +167,7 @@ class NorMuon(DistributedOrthoBase):
                 adjust_lr=group["adjust_lr"],
                 device_rank=self._device_rank,
                 world_size=self._world_size,
+                step=group["step"],
                 process_group=self._process_group,
                 newton_schulz_func=self._newton_schulz_func,
                 cautious_wd=group["cautious_wd"],
@@ -232,6 +234,7 @@ def normuon_update_megabatch_async(
     adjust_lr: Optional[str],
     device_rank: int,
     world_size: int,
+    step: int = 0,
     shard_dim: Optional[int] = None,
     process_group: Optional[ProcessGroup] = None,
     newton_schulz_func: Optional[Callable] = None,
@@ -289,15 +292,14 @@ def normuon_update_megabatch_async(
         V_local[i].copy_(V_stacked[i])
     U = [U_stacked[i] for i in range(N)]
 
-    # Log update norms (all ranks participate in all-gather)
-    if wandb is not None and (wandb.run is not None or world_size > 1):
-        _log_normuon_norms(
-            names=names,
-            U=U,
-            device_rank=device_rank,
-            world_size=world_size,
-            process_group=process_group,
-        )
+    # Log update norms to file (per-rank, no all-gather needed)
+    _log_norms_to_file(
+        names=names,
+        U=U,
+        step=step,
+        device_rank=device_rank,
+        world_size=world_size,
+    )
 
     # Compute scaled learning rate
     if adjust_lr is None:
@@ -355,31 +357,21 @@ def normuon_normalization_stacked(
     return normalized_U, V
 
 
-def _log_normuon_norms(
+def _log_norms_to_file(
     names: List[str],
     U: List[Tensor],
+    step: int,
     device_rank: int,
     world_size: int,
-    process_group: Optional[ProcessGroup],
 ):
-    """All-gather update norms across FSDP ranks; log from rank 0."""
-    if world_size <= 1:
-        for name, u in zip(names, U):
-            payload = {
-                f"neuron_update_norm/{name}": u.norm(dim=-1).flatten().tolist(),
-            }
-            wandb.log(payload, commit=False)
-        return
-
-    for name, u in zip(names, U):
-        local_norms = u.norm(dim=-1).flatten()  # [rows_per_rank]
-
-        # All-gather norms
-        gathered_norms = [torch.empty_like(local_norms) for _ in range(world_size)]
-        dist.all_gather(gathered_norms, local_norms, group=process_group)
-
-        if device_rank == 0:
-            payload = {
-                f"neuron_update_norm/{name}": torch.cat(gathered_norms).tolist(),
-            }
-            wandb.log(payload, commit=False)
+    """Save per-rank update norms to file. No all-gather needed."""
+    out_dir = "norm_logs"
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, f"step_{step:06d}_rank_{device_rank}.pt")
+    norms = {name: u.norm(dim=-1).flatten().detach().cpu() for name, u in zip(names, U)}
+    torch.save({
+        "step": step,
+        "rank": device_rank,
+        "world_size": world_size,
+        "norms": norms,
+    }, path)
