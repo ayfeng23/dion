@@ -357,6 +357,9 @@ def normuon_normalization_stacked(
     return normalized_U, V
 
 
+_NORM_LOG_CHUNK_SIZE = 500
+
+
 def _log_norms_to_file(
     names: List[str],
     U: List[Tensor],
@@ -364,20 +367,27 @@ def _log_norms_to_file(
     device_rank: int,
     world_size: int,
 ):
-    """Save per-rank update norms to file. No all-gather needed."""
+    """Save per-rank update norms to chunked files (1000 steps per file)."""
     out_dir = os.path.join(os.environ.get("OUTPUT_ROOT", "."), "norm_logs")
     os.makedirs(out_dir, exist_ok=True)
-    path = os.path.join(out_dir, f"step_{step:06d}_rank_{device_rank}.pt")
+    chunk_start = (step // _NORM_LOG_CHUNK_SIZE) * _NORM_LOG_CHUNK_SIZE
+    path = os.path.join(out_dir, f"chunk_{chunk_start:06d}_rank_{device_rank}.pt")
     norms = {name: u.norm(dim=-1).flatten().detach().cpu() for name, u in zip(names, U)}
-    # Merge with existing file (multiple megabatch groups write to same step+rank)
+    # Load existing chunk file if present (accumulates steps + megabatch groups)
     if os.path.exists(path):
         existing = torch.load(path, weights_only=False)
-        existing["norms"].update(norms)
-        torch.save(existing, path)
+        step_data = existing.get("steps", {})
     else:
-        torch.save({
-            "step": step,
-            "rank": device_rank,
-            "world_size": world_size,
-            "norms": norms,
-        }, path)
+        existing = None
+        step_data = {}
+    # Merge norms for this step (multiple megabatch groups write to same step+rank)
+    if step in step_data:
+        step_data[step].update(norms)
+    else:
+        step_data[step] = norms
+    torch.save({
+        "chunk_start": chunk_start,
+        "rank": device_rank,
+        "world_size": world_size,
+        "steps": step_data,
+    }, path)

@@ -345,6 +345,9 @@ def dion2_update_megabatch_async(
 _dion2_step_counter = [0]
 
 
+_NORM_LOG_CHUNK_SIZE = 500
+
+
 def _log_norms_to_file_dion2(
     names: List[str],
     indices_list: List[Tensor],
@@ -354,31 +357,43 @@ def _log_norms_to_file_dion2(
     world_size: int,
     shard_size: int = 0,
 ):
-    """Save per-rank update norms and selected indices to file."""
+    """Save per-rank update norms and selected indices to chunked files (1000 steps per file)."""
     out_dir = os.path.join(os.environ.get("OUTPUT_ROOT", "."), "norm_logs")
     os.makedirs(out_dir, exist_ok=True)
-    path = os.path.join(out_dir, f"step_{step:06d}_rank_{device_rank}.pt")
+    chunk_start = (step // _NORM_LOG_CHUNK_SIZE) * _NORM_LOG_CHUNK_SIZE
+    path = os.path.join(out_dir, f"chunk_{chunk_start:06d}_rank_{device_rank}.pt")
     norms = {}
     indices = {}
     for name, idx, u in zip(names, indices_list, U_ortho):
         norms[name] = u.norm(dim=-1).flatten().detach().cpu()
         indices[name] = idx.detach().cpu()
-    # Merge with existing file (multiple megabatch groups write to same step+rank)
+    shard_sizes_this = {name: shard_size for name in names}
+    # Load existing chunk file if present (accumulates steps + megabatch groups)
     if os.path.exists(path):
         existing = torch.load(path, weights_only=False)
-        existing["norms"].update(norms)
-        existing["indices"].update(indices)
-        existing["shard_sizes"].update({name: shard_size for name in names})
-        torch.save(existing, path)
+        step_norms = existing.get("steps_norms", {})
+        step_indices = existing.get("steps_indices", {})
+        all_shard_sizes = existing.get("shard_sizes", {})
     else:
-        torch.save({
-            "step": step,
-            "rank": device_rank,
-            "world_size": world_size,
-            "shard_sizes": {name: shard_size for name in names},
-            "norms": norms,
-            "indices": indices,
-        }, path)
+        step_norms = {}
+        step_indices = {}
+        all_shard_sizes = {}
+    # Merge for this step (multiple megabatch groups write to same step+rank)
+    if step in step_norms:
+        step_norms[step].update(norms)
+        step_indices[step].update(indices)
+    else:
+        step_norms[step] = norms
+        step_indices[step] = indices
+    all_shard_sizes.update(shard_sizes_this)
+    torch.save({
+        "chunk_start": chunk_start,
+        "rank": device_rank,
+        "world_size": world_size,
+        "shard_sizes": all_shard_sizes,
+        "steps_norms": step_norms,
+        "steps_indices": step_indices,
+    }, path)
 
 
 # Workaround for a torch.compile bug in PyTorch ≤2.11's inductor backend:
