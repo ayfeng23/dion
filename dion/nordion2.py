@@ -374,6 +374,37 @@ def nordion2_update_megabatch_async(
 
 _NORM_LOG_CHUNK_SIZE = 500
 
+# In-memory buffer: {(chunk_start, rank): {"norms": {step: {...}}, "indices": {step: {...}}, "shard_sizes": {...}}}
+_norm_log_buffer_nordion2: dict = {}
+_norm_log_meta_nordion2: dict = {}  # {(chunk_start, rank): (world_size, out_dir)}
+_norm_log_atexit_registered_nordion2 = False
+_norm_log_prev_chunk_nordion2: dict = {}  # {rank: previous chunk_start}
+
+
+def _flush_norm_buffer_nordion2(chunk_key=None):
+    """Write buffered norms to disk. If chunk_key is None, flush all."""
+    keys = [chunk_key] if chunk_key else list(_norm_log_buffer_nordion2.keys())
+    for key in keys:
+        if key not in _norm_log_buffer_nordion2:
+            continue
+        buf = _norm_log_buffer_nordion2.pop(key)
+        chunk_start, rank = key
+        world_size, out_dir = _norm_log_meta_nordion2.pop(key)
+        os.makedirs(out_dir, exist_ok=True)
+        path = os.path.join(out_dir, f"chunk_{chunk_start:06d}_rank_{rank}.pt")
+        torch.save({
+            "chunk_start": chunk_start,
+            "rank": rank,
+            "world_size": world_size,
+            "shard_sizes": buf["shard_sizes"],
+            "steps_norms": buf["norms"],
+            "steps_indices": buf["indices"],
+        }, path)
+
+
+def _flush_all_norm_buffers_nordion2():
+    _flush_norm_buffer_nordion2(None)
+
 
 def _log_norms_to_file_nordion2(
     names: List[str],
@@ -384,43 +415,43 @@ def _log_norms_to_file_nordion2(
     world_size: int,
     shard_size: int = 0,
 ):
-    """Save per-rank update norms and selected indices to chunked files (1000 steps per file)."""
+    """Buffer per-rank update norms and indices; flush to disk every 500 steps."""
+    global _norm_log_atexit_registered_nordion2
+    if not _norm_log_atexit_registered_nordion2:
+        import atexit
+        atexit.register(_flush_all_norm_buffers_nordion2)
+        _norm_log_atexit_registered_nordion2 = True
+
     out_dir = os.path.join(os.environ.get("OUTPUT_ROOT", "."), "norm_logs")
-    os.makedirs(out_dir, exist_ok=True)
     chunk_start = (step // _NORM_LOG_CHUNK_SIZE) * _NORM_LOG_CHUNK_SIZE
-    path = os.path.join(out_dir, f"chunk_{chunk_start:06d}_rank_{device_rank}.pt")
+    key = (chunk_start, device_rank)
+
     norms = {}
     indices = {}
     for name, idx, u in zip(names, indices_list, U_normed):
         norms[name] = u.norm(dim=-1).flatten().detach().cpu()
         indices[name] = idx.detach().cpu()
-    shard_sizes_this = {name: shard_size for name in names}
-    # Load existing chunk file if present (accumulates steps + megabatch groups)
-    if os.path.exists(path):
-        existing = torch.load(path, weights_only=False)
-        step_norms = existing.get("steps_norms", {})
-        step_indices = existing.get("steps_indices", {})
-        all_shard_sizes = existing.get("shard_sizes", {})
+
+    # Flush previous chunk when we move to a new one
+    prev_chunk = _norm_log_prev_chunk_nordion2.get(device_rank)
+    if prev_chunk is not None and prev_chunk != chunk_start:
+        old_key = (prev_chunk, device_rank)
+        if old_key in _norm_log_buffer_nordion2:
+            _flush_norm_buffer_nordion2(old_key)
+    _norm_log_prev_chunk_nordion2[device_rank] = chunk_start
+
+    if key not in _norm_log_buffer_nordion2:
+        _norm_log_buffer_nordion2[key] = {"norms": {}, "indices": {}, "shard_sizes": {}}
+        _norm_log_meta_nordion2[key] = (world_size, out_dir)
+
+    buf = _norm_log_buffer_nordion2[key]
+    if step in buf["norms"]:
+        buf["norms"][step].update(norms)
+        buf["indices"][step].update(indices)
     else:
-        step_norms = {}
-        step_indices = {}
-        all_shard_sizes = {}
-    # Merge for this step (multiple megabatch groups write to same step+rank)
-    if step in step_norms:
-        step_norms[step].update(norms)
-        step_indices[step].update(indices)
-    else:
-        step_norms[step] = norms
-        step_indices[step] = indices
-    all_shard_sizes.update(shard_sizes_this)
-    torch.save({
-        "chunk_start": chunk_start,
-        "rank": device_rank,
-        "world_size": world_size,
-        "shard_sizes": all_shard_sizes,
-        "steps_norms": step_norms,
-        "steps_indices": step_indices,
-    }, path)
+        buf["norms"][step] = norms
+        buf["indices"][step] = indices
+    buf["shard_sizes"].update({name: shard_size for name in names})
 
 
 @torch.compile(fullgraph=True)

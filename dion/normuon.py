@@ -359,6 +359,35 @@ def normuon_normalization_stacked(
 
 _NORM_LOG_CHUNK_SIZE = 500
 
+# In-memory buffer: {(chunk_start, rank): {step: {name: tensor}}}
+_norm_log_buffer: dict = {}
+_norm_log_meta: dict = {}  # {(chunk_start, rank): (world_size, out_dir)}
+_norm_log_atexit_registered = False
+_norm_log_prev_chunk: dict = {}  # {rank: previous chunk_start}
+
+
+def _flush_norm_buffer(chunk_key=None):
+    """Write buffered norms to disk. If chunk_key is None, flush all."""
+    keys = [chunk_key] if chunk_key else list(_norm_log_buffer.keys())
+    for key in keys:
+        if key not in _norm_log_buffer:
+            continue
+        step_data = _norm_log_buffer.pop(key)
+        chunk_start, rank = key
+        world_size, out_dir = _norm_log_meta.pop(key)
+        os.makedirs(out_dir, exist_ok=True)
+        path = os.path.join(out_dir, f"chunk_{chunk_start:06d}_rank_{rank}.pt")
+        torch.save({
+            "chunk_start": chunk_start,
+            "rank": rank,
+            "world_size": world_size,
+            "steps": step_data,
+        }, path)
+
+
+def _flush_all_norm_buffers():
+    _flush_norm_buffer(None)
+
 
 def _log_norms_to_file(
     names: List[str],
@@ -367,27 +396,33 @@ def _log_norms_to_file(
     device_rank: int,
     world_size: int,
 ):
-    """Save per-rank update norms to chunked files (1000 steps per file)."""
+    """Buffer per-rank update norms in memory; flush to disk every 500 steps."""
+    global _norm_log_atexit_registered
+    if not _norm_log_atexit_registered:
+        import atexit
+        atexit.register(_flush_all_norm_buffers)
+        _norm_log_atexit_registered = True
+
     out_dir = os.path.join(os.environ.get("OUTPUT_ROOT", "."), "norm_logs")
-    os.makedirs(out_dir, exist_ok=True)
     chunk_start = (step // _NORM_LOG_CHUNK_SIZE) * _NORM_LOG_CHUNK_SIZE
-    path = os.path.join(out_dir, f"chunk_{chunk_start:06d}_rank_{device_rank}.pt")
+    key = (chunk_start, device_rank)
     norms = {name: u.norm(dim=-1).flatten().detach().cpu() for name, u in zip(names, U)}
-    # Load existing chunk file if present (accumulates steps + megabatch groups)
-    if os.path.exists(path):
-        existing = torch.load(path, weights_only=False)
-        step_data = existing.get("steps", {})
-    else:
-        existing = None
-        step_data = {}
+
+    # Flush previous chunk when we move to a new one
+    prev_chunk = _norm_log_prev_chunk.get(device_rank)
+    if prev_chunk is not None and prev_chunk != chunk_start:
+        old_key = (prev_chunk, device_rank)
+        if old_key in _norm_log_buffer:
+            _flush_norm_buffer(old_key)
+    _norm_log_prev_chunk[device_rank] = chunk_start
+
+    if key not in _norm_log_buffer:
+        _norm_log_buffer[key] = {}
+        _norm_log_meta[key] = (world_size, out_dir)
+
     # Merge norms for this step (multiple megabatch groups write to same step+rank)
+    step_data = _norm_log_buffer[key]
     if step in step_data:
         step_data[step].update(norms)
     else:
         step_data[step] = norms
-    torch.save({
-        "chunk_start": chunk_start,
-        "rank": device_rank,
-        "world_size": world_size,
-        "steps": step_data,
-    }, path)
